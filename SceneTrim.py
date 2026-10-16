@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bhw Cutter GUI - By Baraa Hawamdeh
+SceneTrim - By Baraa Hawamdeh
 Standalone single-file GUI wrapper that performs scene removal/cutting
 without using movies.json. Drop this next to your video files
 or use it standalone (it includes the necessary cutting logic).
@@ -11,7 +11,7 @@ Prereqs:
 
 Build to EXE (optional):
     pip install pyinstaller
-    pyinstaller --noconsole --onefile Bhw_cutter_gui.py
+    pyinstaller --noconsole --onefile --name SceneTrim SceneTrim.py
 """
 
 import os
@@ -67,16 +67,16 @@ FFMPEG = resolve_binary("ffmpeg", "FFMPEG")
 FFPROBE = resolve_binary("ffprobe", "FFPROBE")
 
 # ---------------- Configuration ----------------
-TEMP_ROOT = os.path.join(tempfile.gettempdir(), "bhw_cutter_parts")
+TEMP_ROOT = os.path.join(tempfile.gettempdir(), "scenetrim_parts")
 GPU_ENCODER = "h264_nvenc"
-NVENC_RATECTRL = ["-rc", "vbr_hq", "-cq", "19"]
+NVENC_RATECTRL = ["-rc", "vbr", "-tune", "hq", "-cq", "19", "-b:v", "0"]
 NVENC_PRESET = ["-preset", "p2"]
 AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "192k"
 
 # UI strings
 AUTHOR = "By Baraa Hawamdeh"
-APP_TITLE = f"Bhw Cutter GUI — {AUTHOR}"
+APP_TITLE = f"SceneTrim — {AUTHOR}"
 
 # Global process tracking and cancel flag
 current_process: Optional[subprocess.Popen] = None
@@ -688,32 +688,119 @@ def processing_worker(in_folder: str, out_folder: str, episodes: dict, window: s
     window.write_event_value("-PROCESSING_DONE-", None)
 
 
+# ---------------- GUI Theme & Styling ----------------
+sg.theme("DarkGrey14")
+
+FONT_FAMILY = "Segoe UI"
+FONT_TITLE = (FONT_FAMILY, 15, "bold")
+FONT_SUBTITLE = (FONT_FAMILY, 9)
+FONT_LABEL = (FONT_FAMILY, 9, "bold")
+FONT_TEXT = (FONT_FAMILY, 9)
+FONT_MONO = ("Consolas", 9)
+FONT_BTN = (FONT_FAMILY, 9, "bold")
+
 # ---------------- GUI Layout ----------------
 
-layout = [
-    [sg.Text(APP_TITLE, font=("Any", 16), justification="center")],
-    [sg.Text(AUTHOR, font=("Any", 10), pad=((0, 0), (0, 10)))],
-    [sg.Text("Input Folder:"), sg.InputText(key="-IN-", expand_x=True), sg.FolderBrowse(button_text="Browse")],
-    [sg.Text("Output Folder:"), sg.InputText(key="-OUT-", expand_x=True), sg.FolderBrowse(button_text="Browse")],
-    [sg.Text("Paste episode blocks below (example format shown on right):")],
+folder_frame = [
     [
-        sg.Multiline(default_text="E01\n29:32-30:17\n44:22-45:15\n\nE02\nclear\n\nE03\n17:33-17:42",
-                     size=(60, 12), key="-TEXT-", expand_x=True, expand_y=True),
-        sg.Column([
-            [sg.Text("Example format:")],
-            [sg.Text("E01\n29:32-30:17\n44:22-45:15\n\nE02\nclear", size=(30,6))],
-            [sg.Text("Tips:" )],
-            [sg.Text("- Use HH:MM:SS or MM:SS or seconds")],
-            [sg.Text("- 'clear' under an episode => no cuts (copy)")]
-        ], vertical_alignment="top")
+        sg.Text("Input Folder:", size=(12, 1), font=FONT_LABEL),
+        sg.InputText(key="-IN-", expand_x=True, font=FONT_TEXT),
+        sg.FolderBrowse("Browse", button_color=("white", "#30363d"), font=FONT_TEXT, size=(8, 1))
     ],
-    [sg.Button("Run Cutter", key="-RUN-", size=(12,1)), sg.Button("Stop", key="-STOP-", disabled=True), sg.Button("Clear Log", key="-CLR-")],
-    [sg.Text("Live Log:" )],
-    [sg.Multiline(size=(100, 20), key="-LOG-", autoscroll=True, disabled=True, expand_x=True, expand_y=True)],
-    [sg.Text("Status:"), sg.Text("Idle", key="-STATUS-")],
+    [
+        sg.Text("Output Folder:", size=(12, 1), font=FONT_LABEL),
+        sg.InputText(key="-OUT-", expand_x=True, font=FONT_TEXT),
+        sg.FolderBrowse("Browse", button_color=("white", "#30363d"), font=FONT_TEXT, size=(8, 1))
+    ]
 ]
 
-window = sg.Window(APP_TITLE, layout, resizable=True, finalize=True)
+help_column = [
+    [sg.Text("Format Rules:", font=(FONT_FAMILY, 9, "bold"), text_color="#58a6ff")],
+    [sg.Text("- Line 1: Video name (no ext)", font=FONT_TEXT)],
+    [sg.Text("- Next lines: Sections to delete", font=FONT_TEXT)],
+    [sg.Text("- Format: MM:SS-MM:SS or SS", font=FONT_TEXT)],
+    [sg.Text("- 'clear' => copy without cut", font=FONT_TEXT)],
+    [sg.Text("- Separate videos with empty line", font=FONT_TEXT)],
+    [sg.Text("Example:", font=(FONT_FAMILY, 8, "bold"), text_color="#8b949e", pad=((0, 0), (6, 0)))],
+    [sg.Multiline(
+        default_text="E01\n01:30-02:15\n14:00-14:45\n\nE02\nclear",
+        size=(24, 5),
+        disabled=True,
+        no_scrollbar=True,
+        font=FONT_MONO,
+        text_color="#7ee787",
+        background_color="#161b22"
+    )]
+]
+
+cut_frame = [
+    [
+        sg.Multiline(
+            default_text="E01\n29:32-30:17\n44:22-45:15\n\nE02\nclear\n\nE03\n17:33-17:42",
+            size=(45, 9),
+            key="-TEXT-",
+            font=FONT_MONO,
+            expand_x=True,
+            expand_y=True
+        ),
+        sg.Column(help_column, vertical_alignment="top", pad=((10, 0), (0, 0)))
+    ]
+]
+
+actions_row = [
+    sg.Button("  Run Cutter  ", key="-RUN-", button_color=("white", "#238636"), font=FONT_BTN, size=(13, 1), pad=((0, 6), (0, 0))),
+    sg.Button("  Stop  ", key="-STOP-", disabled=True, button_color=("white", "#da3633"), font=FONT_BTN, size=(9, 1), pad=((0, 6), (0, 0))),
+    sg.Button("Clear Log", key="-CLR-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(9, 1)),
+    sg.Push(),
+    sg.Text("Status:", font=FONT_LABEL),
+    sg.Text("Idle", key="-STATUS-", font=FONT_BTN, text_color="#58a6ff", size=(12, 1))
+]
+
+log_frame = [
+    [
+        sg.Multiline(
+            size=(90, 14),
+            key="-LOG-",
+            autoscroll=True,
+            disabled=True,
+            font=FONT_MONO,
+            background_color="#0d1117",
+            text_color="#c9d1d9",
+            expand_x=True,
+            expand_y=True
+        )
+    ]
+]
+
+layout = [
+    # Header
+    [
+        sg.Column([
+            [
+                sg.Text("SceneTrim", font=FONT_TITLE, text_color="#58a6ff"),
+                sg.Text(f"— {AUTHOR}", font=FONT_SUBTITLE, text_color="#8b949e", pad=((6, 0), (5, 0)))
+            ],
+            [sg.Text("Automated high-performance video trimming and scene removal via FFmpeg", font=FONT_SUBTITLE, text_color="#8b949e", pad=((0, 0), (0, 4)))]
+        ], pad=((0, 0), (0, 4)))
+    ],
+    # Section 1: Directories
+    [sg.Frame(" Directories ", folder_frame, font=FONT_LABEL, expand_x=True, pad=((0, 0), (0, 6)))],
+    # Section 2: Episodes & Cut Intervals
+    [sg.Frame(" Episodes & Cut Intervals ", cut_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
+    # Controls & Status
+    actions_row,
+    # Section 3: Live Output Log
+    [sg.Frame(" Live Process Log ", log_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (6, 0)))]
+]
+
+window = sg.Window(
+    APP_TITLE,
+    layout,
+    resizable=True,
+    finalize=True,
+    margins=(15, 12),
+    element_padding=(4, 4)
+)
 
 # ---------------- Initial Startup Checks ----------------
 missing_tools = []

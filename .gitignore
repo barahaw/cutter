@@ -1,0 +1,13 @@
+# Virtual environment & Python cache
+.venv/
+__pycache__/
+*.pyc
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Release packages
+SceneTrim_release/
+*.zip
