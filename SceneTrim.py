@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 SceneTrim - By Baraa Hawamdeh
-Standalone single-file GUI wrapper that performs scene removal/cutting
-without using movies.json. Drop this next to your video files
-or use it standalone (it includes the necessary cutting logic).
+Standalone single-file GUI that cuts/removes scenes from movies and episodes
+using FFmpeg.
 
 Prereqs:
     pip install FreeSimpleGUI
@@ -22,7 +21,6 @@ import tempfile
 import time
 import shutil
 import threading
-from pathlib import Path
 from typing import List, Tuple, Optional
 
 import FreeSimpleGUI as sg
@@ -40,28 +38,27 @@ def resolve_binary(binary_name: str, env_var: str) -> Optional[str]:
     if env_val and os.path.isfile(env_val):
         return env_val
 
-    # Directory where script or frozen exe is located
     if getattr(sys, 'frozen', False):
         base_dir = os.path.dirname(sys.executable)
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Check next to script/exe
-    candidate = os.path.join(base_dir, f"{binary_name}.exe" if sys.platform == "win32" else binary_name)
+    exe_name = f"{binary_name}.exe" if sys.platform == "win32" else binary_name
+
+    candidate = os.path.join(base_dir, exe_name)
     if os.path.isfile(candidate):
         return candidate
 
-    # Check current working directory
-    cwd_candidate = os.path.join(os.getcwd(), f"{binary_name}.exe" if sys.platform == "win32" else binary_name)
+    cwd_candidate = os.path.join(os.getcwd(), exe_name)
     if os.path.isfile(cwd_candidate):
         return cwd_candidate
 
-    # Check PATH
     found = shutil.which(binary_name)
     if found:
         return found
 
     return None
+
 
 FFMPEG = resolve_binary("ffmpeg", "FFMPEG")
 FFPROBE = resolve_binary("ffprobe", "FFPROBE")
@@ -73,6 +70,8 @@ NVENC_RATECTRL = ["-rc", "vbr", "-tune", "hq", "-cq", "19", "-b:v", "0"]
 NVENC_PRESET = ["-preset", "p2"]
 AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "192k"
+
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".ts", ".m4v", ".avi", ".webm"}
 
 # UI strings
 AUTHOR = "By Baraa Hawamdeh"
@@ -101,6 +100,8 @@ def run_subprocess_live(cmd: List[str], window: sg.Window, out_key: str = "-LOG-
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         )
@@ -110,7 +111,6 @@ def run_subprocess_live(cmd: List[str], window: sg.Window, out_key: str = "-LOG-
         window.write_event_value("-LOG_LINE-", f"Failed to start: {e}")
         return 1
 
-    # Read stdout and stderr
     def stream_reader(pipe):
         try:
             for line in iter(pipe.readline, ''):
@@ -156,7 +156,8 @@ def ffprobe_duration(path: str, window: Optional[sg.Window] = None) -> float:
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             path,
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
 
         if res.returncode != 0:
             err_msg = f"[WARN] ffprobe failed (code {res.returncode}): {res.stderr.strip()}"
@@ -208,48 +209,75 @@ def parse_time_to_seconds(t: str) -> float:
 
 # ---------------- Parsing user textbox ----------------
 
-EPISODE_HEADER_RE = re.compile(r"^\s*(?:E|EP|EPISODE)?\s*([0-9A-Za-z_\-\.]+)\s*$", re.IGNORECASE)
-TIME_RANGE_RE = re.compile(r"^(?P<a>[^\-\s]+)\s*[-–—]\s*(?P<b>[^\s]+)\s*$")
+# Matches: 33:09-33:24 | 1:02:03-1:05:00 | 90-120 | 12.5-15
+TIME_RANGE_RE = re.compile(
+    r"^\s*(?P<a>\d+(?::\d+){0,2}(?:\.\d+)?)\s*[-–—]\s*(?P<b>\d+(?::\d+){0,2}(?:\.\d+)?)\s*$"
+)
 
 
 def parse_episodes_text(text: str) -> dict:
-    lines = text.splitlines()
+    """
+    Blocks are separated by an empty line.
+    First line of each block = video name (kept exactly as typed).
+    Next lines = time ranges to delete, or 'clear' to copy without cutting.
+    """
     episodes = {}
     current = None
-    for raw in lines:
+    for raw in text.splitlines():
         line = raw.strip()
         if not line:
             current = None
             continue
-        m_hdr = EPISODE_HEADER_RE.match(line)
-        m_time = TIME_RANGE_RE.match(line)
-        if m_hdr and not m_time:
-            name = m_hdr.group(1)
-            safe = re.sub(r"[^0-9A-Za-z_\-\. ]+", "", name).strip()
-            safe = safe.replace(" ", "_")
-            current = safe
-            if current not in episodes:
-                episodes[current] = []
-            continue
-        if line.lower() == "clear" and current:
-            episodes[current] = []
-            continue
-        if current and m_time:
-            a = m_time.group("a")
-            b = m_time.group("b")
-            sa = parse_time_to_seconds(a)
-            sb = parse_time_to_seconds(b)
-            if sb <= sa:
-                continue
-            episodes[current].append((round(sa, 3), round(sb, 3)))
-            continue
         if current is None:
-            name = line
-            safe = re.sub(r"[^0-9A-Za-z_\-\. ]+", "", name).strip().replace(" ", "_")
-            current = safe
+            current = line
+            episodes.setdefault(current, [])
+            continue
+        if line.lower() == "clear":
             episodes[current] = []
             continue
+        m = TIME_RANGE_RE.match(line)
+        if m:
+            sa = parse_time_to_seconds(m.group("a"))
+            sb = parse_time_to_seconds(m.group("b"))
+            if sb > sa:
+                episodes[current].append((round(sa, 3), round(sb, 3)))
     return episodes
+
+
+# ---------------- Finding the video file ----------------
+
+def norm_name(s: str) -> str:
+    """Lowercase and strip everything except letters/digits for tolerant matching."""
+    return re.sub(r"[^0-9a-z]+", "", s.lower())
+
+
+def find_video(folder: str, name: str) -> str:
+    """Find a video file in folder (recursive) matching name. Ignores subtitles etc."""
+    stem, ext = os.path.splitext(name)
+    if ext.lower() not in VIDEO_EXTS:
+        stem = name
+    target = norm_name(stem)
+    if not target:
+        return ""
+
+    files = []
+    for root, _, fs in os.walk(folder):
+        for f in fs:
+            s, e = os.path.splitext(f)
+            if e.lower() in VIDEO_EXTS:
+                files.append((os.path.join(root, f), norm_name(s)))
+
+    # Exact match (ignoring punctuation/case)
+    for p, n in files:
+        if n == target:
+            return p
+
+    # Fallback: unique partial match
+    if len(target) >= 5:
+        c = [p for p, n in files if target in n]
+        if len(c) == 1:
+            return c[0]
+    return ""
 
 
 # ---------------- FFmpeg cutting strategies ----------------
@@ -269,17 +297,10 @@ def concat_demuxer(parts: List[str], out_path: str, window: sg.Window) -> bool:
             for p in parts:
                 f.write(f"file '{safe_path_for_concat(p)}'\n")
         cmd = [
-            FFMPEG,
-            "-y",
-            "-nostdin",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_txt,
-            "-c",
-            "copy",
+            FFMPEG, "-y", "-nostdin",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_txt,
+            "-c", "copy",
             out_path,
         ]
         window.write_event_value("-LOG_LINE-", "Running concat demuxer (stream-copy)...")
@@ -291,26 +312,15 @@ def concat_demuxer(parts: List[str], out_path: str, window: sg.Window) -> bool:
 
         window.write_event_value("-LOG_LINE-", "Concat demuxer failed, trying re-encode concat (NVENC)...")
         cmd_nvenc = [
-            FFMPEG,
-            "-y",
-            "-nostdin",
-            "-hwaccel",
-            "cuda",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_txt,
+            FFMPEG, "-y", "-nostdin",
+            "-hwaccel", "cuda",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_txt,
         ] + NVENC_PRESET + NVENC_RATECTRL + [
-            "-c:v",
-            GPU_ENCODER,
-            "-c:a",
-            AUDIO_CODEC,
-            "-ac",
-            "2",
-            "-b:a",
-            AUDIO_BITRATE,
+            "-c:v", GPU_ENCODER,
+            "-c:a", AUDIO_CODEC,
+            "-ac", "2",
+            "-b:a", AUDIO_BITRATE,
             out_path,
         ]
         rc2 = run_subprocess_live(cmd_nvenc, window)
@@ -321,27 +331,11 @@ def concat_demuxer(parts: List[str], out_path: str, window: sg.Window) -> bool:
 
         # CPU fallback
         cmd_cpu = [
-            FFMPEG,
-            "-y",
-            "-nostdin",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_txt,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            "18",
-            "-c:a",
-            AUDIO_CODEC,
-            "-ac",
-            "2",
-            "-b:a",
-            AUDIO_BITRATE,
+            FFMPEG, "-y", "-nostdin",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_txt,
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "-c:a", AUDIO_CODEC, "-ac", "2", "-b:a", AUDIO_BITRATE,
             out_path,
         ]
         rc3 = run_subprocess_live(cmd_cpu, window)
@@ -358,52 +352,35 @@ def try_streamcopy_segment(input_path: str, start: float, end: float, out_path: 
     if cancel_requested:
         return False
     cmd = [
-        FFMPEG,
-        "-y",
-        "-nostdin",
-        "-ss",
-        str(start),
-        "-to",
-        str(end),
-        "-i",
-        input_path,
-        "-c",
-        "copy",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-fflags",
-        "+genpts",
+        FFMPEG, "-y", "-nostdin",
+        "-ss", str(start),
+        "-to", str(end),
+        "-i", input_path,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        "-fflags", "+genpts",
         out_path,
     ]
     rc = run_subprocess_live(cmd, window)
     return rc == 0 and os.path.exists(out_path)
 
 
-def try_reencode_segment_nvenc(input_path: str, start: float, end: float, out_path: str, window: sg.Window, force_cpu=False) -> bool:
+def try_reencode_segment_nvenc(input_path: str, start: float, end: float, out_path: str,
+                               window: sg.Window, force_cpu=False) -> bool:
     if cancel_requested:
         return False
     if not force_cpu:
         cmd = [
-            FFMPEG,
-            "-y",
-            "-nostdin",
-            "-ss",
-            str(start),
-            "-to",
-            str(end),
-            "-i",
-            input_path,
+            FFMPEG, "-y", "-nostdin",
+            "-ss", str(start),
+            "-to", str(end),
+            "-i", input_path,
         ] + NVENC_PRESET + NVENC_RATECTRL + [
-            "-c:v",
-            GPU_ENCODER,
-            "-c:a",
-            AUDIO_CODEC,
-            "-ac",
-            "2",
-            "-b:a",
-            AUDIO_BITRATE,
-            "-avoid_negative_ts",
-            "make_zero",
+            "-c:v", GPU_ENCODER,
+            "-c:a", AUDIO_CODEC,
+            "-ac", "2",
+            "-b:a", AUDIO_BITRATE,
+            "-avoid_negative_ts", "make_zero",
             out_path,
         ]
         rc = run_subprocess_live(cmd, window)
@@ -414,29 +391,13 @@ def try_reencode_segment_nvenc(input_path: str, start: float, end: float, out_pa
 
     # CPU fallback
     cmd_cpu = [
-        FFMPEG,
-        "-y",
-        "-nostdin",
-        "-ss",
-        str(start),
-        "-to",
-        str(end),
-        "-i",
-        input_path,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "18",
-        "-c:a",
-        AUDIO_CODEC,
-        "-ac",
-        "2",
-        "-b:a",
-        AUDIO_BITRATE,
-        "-avoid_negative_ts",
-        "make_zero",
+        FFMPEG, "-y", "-nostdin",
+        "-ss", str(start),
+        "-to", str(end),
+        "-i", input_path,
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-c:a", AUDIO_CODEC, "-ac", "2", "-b:a", AUDIO_BITRATE,
+        "-avoid_negative_ts", "make_zero",
         out_path,
     ]
     rc2 = run_subprocess_live(cmd_cpu, window)
@@ -457,37 +418,30 @@ def create_segment_flexible(input_path: str, start: float, end: float, idx: int,
     return ""
 
 
-def filter_complex_concat(input_path: str, segments: List[Tuple[float, float]], out_path: str, window: sg.Window) -> bool:
+def filter_complex_concat(input_path: str, segments: List[Tuple[float, float]], out_path: str,
+                          window: sg.Window) -> bool:
     if not segments or cancel_requested:
         return False
     vf_parts = []
     af_parts = []
     for i, (s, e) in enumerate(segments):
-        vf_parts.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS[v{i}]")
-        af_parts.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
+        vf_parts.append(f"[0:v:0]trim=start={s}:end={e},setpts=PTS-STARTPTS[v{i}]")
+        af_parts.append(f"[0:a:0]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
     concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(len(segments))])
-    filter_complex = ";".join(vf_parts + af_parts + [f"{concat_inputs}concat=n={len(segments)}:v=1:a=1[outv][outa]"])
+    filter_complex = ";".join(
+        vf_parts + af_parts + [f"{concat_inputs}concat=n={len(segments)}:v=1:a=1[outv][outa]"]
+    )
     cmd = [
-        FFMPEG,
-        "-y",
-        "-nostdin",
-        "-i",
-        input_path,
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[outv]",
-        "-map",
-        "[outa]",
+        FFMPEG, "-y", "-nostdin",
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-map", "[outa]",
     ] + NVENC_PRESET + NVENC_RATECTRL + [
-        "-c:v",
-        GPU_ENCODER,
-        "-c:a",
-        AUDIO_CODEC,
-        "-ac",
-        "2",
-        "-b:a",
-        AUDIO_BITRATE,
+        "-c:v", GPU_ENCODER,
+        "-c:a", AUDIO_CODEC,
+        "-ac", "2",
+        "-b:a", AUDIO_BITRATE,
         out_path,
     ]
     window.write_event_value("-LOG_LINE-", "Trying filter_complex (single-call concat)...")
@@ -499,29 +453,13 @@ def filter_complex_concat(input_path: str, segments: List[Tuple[float, float]], 
 
     window.write_event_value("-LOG_LINE-", "filter_complex NVENC failed, trying CPU fallback...")
     cmd_cpu = [
-        FFMPEG,
-        "-y",
-        "-nostdin",
-        "-i",
-        input_path,
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[outv]",
-        "-map",
-        "[outa]",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "18",
-        "-c:a",
-        AUDIO_CODEC,
-        "-ac",
-        "2",
-        "-b:a",
-        AUDIO_BITRATE,
+        FFMPEG, "-y", "-nostdin",
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+        "-c:a", AUDIO_CODEC, "-ac", "2", "-b:a", AUDIO_BITRATE,
         out_path,
     ]
     rc2 = run_subprocess_live(cmd_cpu, window)
@@ -531,7 +469,10 @@ def filter_complex_concat(input_path: str, segments: List[Tuple[float, float]], 
 def build_keep_segments(unwanted: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:
     if not unwanted:
         return [(0.0, duration)]
-    intervals = sorted([(max(0.0, float(s)), min(float(e), duration)) for s, e in unwanted], key=lambda x: x[0])
+    intervals = sorted(
+        [(max(0.0, float(s)), min(float(e), duration)) for s, e in unwanted],
+        key=lambda x: x[0]
+    )
     keep = []
     last = 0.0
     for s, e in intervals:
@@ -544,44 +485,32 @@ def build_keep_segments(unwanted: List[Tuple[float, float]], duration: float) ->
     return keep
 
 
-# ---------------- High-level processing per episode ----------------
+# ---------------- High-level processing per video ----------------
 
-def process_episode(input_folder: str, output_folder: str, ep_name: str, unwanted: List[Tuple[float, float]], window: sg.Window) -> Tuple[str, str]:
+def process_episode(input_folder: str, output_folder: str, ep_name: str,
+                    unwanted: List[Tuple[float, float]], window: sg.Window) -> Tuple[str, str]:
     global cancel_requested
     if cancel_requested:
         return ep_name, "Cancelled"
 
-    candidates = []
-    for ext in (".mp4", ".mkv", ".mov", ".ts", ".m4v"):
-        candidates.append(os.path.join(input_folder, ep_name + ext))
-
-    found = ""
-    for root, dirs, files in os.walk(input_folder):
-        for f in files:
-            name_no_ext = os.path.splitext(f)[0]
-            if name_no_ext.lower() == ep_name.lower():
-                found = os.path.join(root, f)
-                break
-        if found:
-            break
-
-    if not found:
-        for c in candidates:
-            if os.path.exists(c):
-                found = c
-                break
-
+    found = find_video(input_folder, ep_name)
     basename = ep_name
-    if not found or not os.path.exists(found):
-        window.write_event_value("-LOG_LINE-", f"[WARN] Input file not found for {ep_name} (tried {len(candidates)} candidates). Skipping.")
+    if not found:
+        window.write_event_value("-LOG_LINE-", f"[WARN] Input file not found for {ep_name}. Skipping.")
         return basename, "Missing-Input"
 
+    window.write_event_value("-LOG_LINE-", f"Found: {found}")
+
     duration = ffprobe_duration(found, window)
+
+    safe_stem = re.sub(r'[<>:"/\\|?*]', "", os.path.splitext(os.path.basename(found))[0])
+    out_path = os.path.join(output_folder, f"{safe_stem}.mp4")
+    os.makedirs(output_folder, exist_ok=True)
+
     if duration <= 0:
         window.write_event_value("-LOG_LINE-", f"[WARN] Could not determine duration for {basename}. Copying original to output.")
-        out_path = os.path.join(output_folder, os.path.basename(found))
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", out_path]
+        fallback_out = os.path.join(output_folder, os.path.basename(found))
+        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", fallback_out]
         rc = run_subprocess_live(cmd, window)
         return basename, "Copied-NoDuration" if rc == 0 else "CopyFailed"
 
@@ -590,15 +519,11 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str, unwante
 
     keep = build_keep_segments(unwanted, duration)
     if not keep:
-        out_path = os.path.join(output_folder, os.path.basename(found))
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         window.write_event_value("-LOG_LINE-", f"No keep segments after removing unwanted for {basename}. Copying original.")
-        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", out_path]
+        fallback_out = os.path.join(output_folder, os.path.basename(found))
+        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", fallback_out]
         rc = run_subprocess_live(cmd, window)
         return basename, "Copied-NoKeep" if rc == 0 else "CopyFailed"
-
-    out_path = os.path.join(output_folder, f"{ep_name}.mp4")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     if len(keep) == 1 and abs(keep[0][0] - 0.0) < 1e-3 and abs(keep[0][1] - duration) < 1e-3:
         window.write_event_value("-LOG_LINE-", f"Keep covers full file for {basename}, copying original.")
@@ -673,7 +598,7 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str, unwante
 def processing_worker(in_folder: str, out_folder: str, episodes: dict, window: sg.Window):
     global cancel_requested
     cancel_requested = False
-    window.write_event_value("-LOG_LINE-", f"Starting run — found {len(episodes)} episode(s)")
+    window.write_event_value("-LOG_LINE-", f"Starting run — found {len(episodes)} video(s)")
 
     for ep, ranges in episodes.items():
         if cancel_requested:
@@ -716,14 +641,14 @@ folder_frame = [
 
 help_column = [
     [sg.Text("Format Rules:", font=(FONT_FAMILY, 9, "bold"), text_color="#58a6ff")],
-    [sg.Text("- Line 1: Video name (no ext)", font=FONT_TEXT)],
+    [sg.Text("- Line 1: Movie / episode filename", font=FONT_TEXT)],
     [sg.Text("- Next lines: Sections to delete", font=FONT_TEXT)],
-    [sg.Text("- Format: MM:SS-MM:SS or SS", font=FONT_TEXT)],
+    [sg.Text("- Times: SS, MM:SS or HH:MM:SS", font=FONT_TEXT)],
     [sg.Text("- 'clear' => copy without cut", font=FONT_TEXT)],
     [sg.Text("- Separate videos with empty line", font=FONT_TEXT)],
     [sg.Text("Example:", font=(FONT_FAMILY, 8, "bold"), text_color="#8b949e", pad=((0, 0), (6, 0)))],
     [sg.Multiline(
-        default_text="E01\n01:30-02:15\n14:00-14:45\n\nE02\nclear",
+        default_text="Carlito's.Way.1993\n33:09-33:24\n\nE01\nclear",
         size=(24, 5),
         disabled=True,
         no_scrollbar=True,
@@ -736,7 +661,7 @@ help_column = [
 cut_frame = [
     [
         sg.Multiline(
-            default_text="E01\n29:32-30:17\n44:22-45:15\n\nE02\nclear\n\nE03\n17:33-17:42",
+            default_text="Carlito's.Way.1993\n33:09-33:24\n\nE01\n29:32-30:17",
             size=(45, 9),
             key="-TEXT-",
             font=FONT_MONO,
@@ -773,23 +698,19 @@ log_frame = [
 ]
 
 layout = [
-    # Header
     [
         sg.Column([
             [
                 sg.Text("SceneTrim", font=FONT_TITLE, text_color="#58a6ff"),
                 sg.Text(f"— {AUTHOR}", font=FONT_SUBTITLE, text_color="#8b949e", pad=((6, 0), (5, 0)))
             ],
-            [sg.Text("Automated high-performance video trimming and scene removal via FFmpeg", font=FONT_SUBTITLE, text_color="#8b949e", pad=((0, 0), (0, 4)))]
+            [sg.Text("Automated high-performance video trimming and scene removal via FFmpeg",
+                     font=FONT_SUBTITLE, text_color="#8b949e", pad=((0, 0), (0, 4)))]
         ], pad=((0, 0), (0, 4)))
     ],
-    # Section 1: Directories
     [sg.Frame(" Directories ", folder_frame, font=FONT_LABEL, expand_x=True, pad=((0, 0), (0, 6)))],
-    # Section 2: Episodes & Cut Intervals
-    [sg.Frame(" Episodes & Cut Intervals ", cut_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
-    # Controls & Status
+    [sg.Frame(" Movies / Episodes & Cut Intervals ", cut_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
     actions_row,
-    # Section 3: Live Output Log
     [sg.Frame(" Live Process Log ", log_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (6, 0)))]
 ]
 
@@ -870,23 +791,28 @@ while True:
             sg.popup_error("Cannot start: ffmpeg or ffprobe is missing!", title="Error")
             continue
 
-        in_folder = values.get("-IN-", "")
-        out_folder = values.get("-OUT-", "")
+        in_folder = values.get("-IN-", "").strip()
+        out_folder = values.get("-OUT-", "").strip()
         text = values.get("-TEXT-", "")
         if not in_folder or not out_folder:
             sg.popup("Please select both input and output folders.")
             continue
+        if os.path.normcase(os.path.abspath(in_folder)) == os.path.normcase(os.path.abspath(out_folder)):
+            sg.popup_error(
+                "Output folder must be different from the input folder,\n"
+                "otherwise the original files could be overwritten.",
+                title="Same Folder"
+            )
+            continue
         episodes = parse_episodes_text(text)
         if not episodes:
-            sg.popup("No episodes parsed from textbox. Check format.")
+            sg.popup("No videos parsed from textbox. Check format.")
             continue
 
-        # UI updates
         window["-RUN-"].update(disabled=True)
         window["-STOP-"].update(disabled=False)
         window["-STATUS-"].update("Running")
 
-        # Launch processing thread
         worker_thread = threading.Thread(
             target=processing_worker,
             args=(in_folder, out_folder, episodes, window),
