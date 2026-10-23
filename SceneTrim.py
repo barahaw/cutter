@@ -24,6 +24,7 @@ import threading
 from typing import List, Tuple, Optional
 
 import FreeSimpleGUI as sg
+import fixer
 
 # ---------------- Locate Binaries ----------------
 
@@ -62,6 +63,10 @@ def resolve_binary(binary_name: str, env_var: str) -> Optional[str]:
 
 FFMPEG = resolve_binary("ffmpeg", "FFMPEG")
 FFPROBE = resolve_binary("ffprobe", "FFPROBE")
+
+# Forward the resolved paths to fixer so it uses the same binaries.
+fixer.FFMPEG = FFMPEG
+fixer.FFPROBE = FFPROBE
 
 # ---------------- Configuration ----------------
 TEMP_ROOT = os.path.join(tempfile.gettempdir(), "scenetrim_parts")
@@ -301,6 +306,7 @@ def concat_demuxer(parts: List[str], out_path: str, window: sg.Window) -> bool:
             "-f", "concat", "-safe", "0",
             "-i", concat_txt,
             "-c", "copy",
+            "-movflags", "+faststart",
             out_path,
         ]
         window.write_event_value("-LOG_LINE-", "Running concat demuxer (stream-copy)...")
@@ -321,6 +327,7 @@ def concat_demuxer(parts: List[str], out_path: str, window: sg.Window) -> bool:
             "-c:a", AUDIO_CODEC,
             "-ac", "2",
             "-b:a", AUDIO_BITRATE,
+            "-movflags", "+faststart",
             out_path,
         ]
         rc2 = run_subprocess_live(cmd_nvenc, window)
@@ -336,6 +343,7 @@ def concat_demuxer(parts: List[str], out_path: str, window: sg.Window) -> bool:
             "-i", concat_txt,
             "-c:v", "libx264", "-preset", "slow", "-crf", "18",
             "-c:a", AUDIO_CODEC, "-ac", "2", "-b:a", AUDIO_BITRATE,
+            "-movflags", "+faststart",
             out_path,
         ]
         rc3 = run_subprocess_live(cmd_cpu, window)
@@ -442,6 +450,7 @@ def filter_complex_concat(input_path: str, segments: List[Tuple[float, float]], 
         "-c:a", AUDIO_CODEC,
         "-ac", "2",
         "-b:a", AUDIO_BITRATE,
+        "-movflags", "+faststart",
         out_path,
     ]
     window.write_event_value("-LOG_LINE-", "Trying filter_complex (single-call concat)...")
@@ -460,6 +469,7 @@ def filter_complex_concat(input_path: str, segments: List[Tuple[float, float]], 
         "-map", "[outa]",
         "-c:v", "libx264", "-preset", "slow", "-crf", "18",
         "-c:a", AUDIO_CODEC, "-ac", "2", "-b:a", AUDIO_BITRATE,
+        "-movflags", "+faststart",
         out_path,
     ]
     rc2 = run_subprocess_live(cmd_cpu, window)
@@ -510,7 +520,7 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str,
     if duration <= 0:
         window.write_event_value("-LOG_LINE-", f"[WARN] Could not determine duration for {basename}. Copying original to output.")
         fallback_out = os.path.join(output_folder, os.path.basename(found))
-        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", fallback_out]
+        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", "-movflags", "+faststart", fallback_out]
         rc = run_subprocess_live(cmd, window)
         return basename, "Copied-NoDuration" if rc == 0 else "CopyFailed"
 
@@ -521,13 +531,13 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str,
     if not keep:
         window.write_event_value("-LOG_LINE-", f"No keep segments after removing unwanted for {basename}. Copying original.")
         fallback_out = os.path.join(output_folder, os.path.basename(found))
-        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", fallback_out]
+        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", "-movflags", "+faststart", fallback_out]
         rc = run_subprocess_live(cmd, window)
         return basename, "Copied-NoKeep" if rc == 0 else "CopyFailed"
 
     if len(keep) == 1 and abs(keep[0][0] - 0.0) < 1e-3 and abs(keep[0][1] - duration) < 1e-3:
         window.write_event_value("-LOG_LINE-", f"Keep covers full file for {basename}, copying original.")
-        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", out_path]
+        cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", "-movflags", "+faststart", out_path]
         rc = run_subprocess_live(cmd, window)
         return basename, "Copied-NoCuts" if rc == 0 else "CopyFailed"
 
@@ -588,12 +598,12 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str,
 
     # Fallback copy
     window.write_event_value("-LOG_LINE-", f"All strategies failed for {basename}. Copying original as fallback.")
-    cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", out_path]
+    cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", "-movflags", "+faststart", out_path]
     rc = run_subprocess_live(cmd, window)
     return basename, "Fallback-Copy" if rc == 0 else "Failed"
 
 
-# ---------------- Worker Thread ----------------
+# ---------------- Cutter Worker Thread ----------------
 
 def processing_worker(in_folder: str, out_folder: str, episodes: dict, window: sg.Window):
     global cancel_requested
@@ -613,6 +623,132 @@ def processing_worker(in_folder: str, out_folder: str, episodes: dict, window: s
     window.write_event_value("-PROCESSING_DONE-", None)
 
 
+# ---------------- Fixer Worker Threads ----------------
+
+def fixer_check_worker(paths: List[str], window: sg.Window):
+    """Check all files and report status back via events. Runs in a daemon thread."""
+    global cancel_requested
+    total = len(paths)
+    for i, path in enumerate(paths):
+        if cancel_requested:
+            break
+        try:
+            info = fixer.check_file(path)
+            status = info["status"]
+            vcodec = info.get("vcodec") or "?"
+            dur = info.get("duration") or 0.0
+            if dur:
+                h = int(dur // 3600)
+                m = int((dur % 3600) // 60)
+                s = int(dur % 60)
+                dur_str = f"{h:02d}:{m:02d}:{s:02d}"
+            else:
+                dur_str = "?"
+        except Exception as e:
+            status = "unknown"
+            vcodec = "?"
+            dur_str = "?"
+            window.write_event_value("-LOG_LINE-", f"[WARN] check_file({os.path.basename(path)}): {e}")
+        window.write_event_value("-FIX_FILE_STATUS-", {
+            "path": path,
+            "status": status,
+            "vcodec": vcodec,
+            "duration": dur_str,
+            "index": i,
+            "total": total,
+        })
+    window.write_event_value("-FIX_DONE-", "check")
+
+
+def fixer_fix_worker(jobs: List[str], outdir: str, suffix: str, window: sg.Window):
+    """Fix all files in jobs. outdir="" means save next to each source file."""
+    global cancel_requested, current_process
+    total = len(jobs)
+    done = 0
+
+    for i, src in enumerate(jobs):
+        if cancel_requested:
+            window.write_event_value("-LOG_LINE-", "[INFO] Fixer cancelled by user.")
+            window.write_event_value("-FIX_FILE_STATUS-", {
+                "path": src, "status": "cancelled", "vcodec": None, "duration": None,
+                "index": i, "total": total,
+            })
+            continue
+
+        stem, ext = os.path.splitext(os.path.basename(src))
+        target_dir = outdir if outdir else os.path.dirname(os.path.abspath(src))
+        dst = os.path.join(target_dir, f"{stem}{suffix}{ext}")
+        tmp_path = dst + ".part.mp4"
+
+        if os.path.exists(dst):
+            window.write_event_value("-LOG_LINE-", f"[WARN] Output already exists, skipping: {dst}")
+            window.write_event_value("-FIX_FILE_STATUS-", {
+                "path": src, "status": "done", "vcodec": None, "duration": None,
+                "index": i, "total": total,
+            })
+            done += 1
+            continue
+
+        window.write_event_value("-LOG_LINE-", f"\n=== Fixing ({i + 1}/{total}): {os.path.basename(src)} ===")
+        window.write_event_value("-FIX_FILE_STATUS-", {
+            "path": src, "status": "fixing...", "vcodec": None, "duration": None,
+            "index": i, "total": total,
+        })
+        window.write_event_value("-FIX_COUNTER-", f"{i + 1}/{total}")
+
+        def _on_process(proc):
+            """Register the ffmpeg Popen so the Stop button can kill it."""
+            global current_process
+            with process_lock:
+                current_process = proc
+
+        def _on_progress(frac):
+            window.write_event_value("-FIX_PROG-", int(frac * 100))
+
+        try:
+            ok = fixer.fix_faststart(
+                src, dst,
+                on_progress=_on_progress,
+                cancel=lambda: cancel_requested,
+                on_process=_on_process,
+            )
+        except Exception as e:
+            window.write_event_value("-LOG_LINE-", f"[ERROR] fix_faststart: {e}")
+            ok = False
+
+        with process_lock:
+            current_process = None
+
+        # Clean up the temp .part.mp4 if cancelled or failed.
+        if not ok and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+                window.write_event_value("-LOG_LINE-", f"[INFO] Cleaned up temp file: {tmp_path}")
+            except Exception:
+                pass
+
+        if cancel_requested:
+            final_status = "cancelled"
+        elif ok:
+            final_status = "done"
+            done += 1
+            window.write_event_value("-LOG_LINE-", f"  -> Fixed: {dst}")
+        else:
+            final_status = "failed"
+            window.write_event_value("-LOG_LINE-", f"  -> FAILED: {os.path.basename(src)}")
+
+        window.write_event_value("-FIX_FILE_STATUS-", {
+            "path": src, "status": final_status, "vcodec": None, "duration": None,
+            "index": i, "total": total,
+        })
+
+    summary = f"Fixer done: {done}/{total} fixed."
+    if cancel_requested:
+        summary += " (cancelled)"
+    window.write_event_value("-LOG_LINE-", f"\n{summary}\n")
+    window.write_event_value("-FIX_DONE-", "fix")
+
+
 # ---------------- GUI Theme & Styling ----------------
 sg.theme("DarkGrey14")
 
@@ -624,7 +760,7 @@ FONT_TEXT = (FONT_FAMILY, 9)
 FONT_MONO = ("Consolas", 9)
 FONT_BTN = (FONT_FAMILY, 9, "bold")
 
-# ---------------- GUI Layout ----------------
+# ---------------- GUI Layout — Cutter tab ----------------
 
 folder_frame = [
     [
@@ -681,6 +817,68 @@ actions_row = [
     sg.Text("Idle", key="-STATUS-", font=FONT_BTN, text_color="#58a6ff", size=(12, 1))
 ]
 
+cutter_tab_layout = [
+    [sg.Frame(" Directories ", folder_frame, font=FONT_LABEL, expand_x=True, pad=((0, 0), (0, 6)))],
+    [sg.Frame(" Movies / Episodes & Cut Intervals ", cut_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
+    actions_row,
+]
+
+# ---------------- GUI Layout — Fixer tab ----------------
+
+fixer_files_btns = [
+    sg.Button("Add Files", key="-FIX_ADD_FILES-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(10, 1)),
+    sg.Button("Add Folder", key="-FIX_ADD_FOLDER-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(10, 1)),
+    sg.Button("Remove Selected", key="-FIX_REMOVE-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(14, 1)),
+    sg.Button("Clear", key="-FIX_CLEAR-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(8, 1)),
+]
+
+fixer_table = sg.Table(
+    values=[],
+    headings=["File", "Status", "Codec", "Duration"],
+    key="-FIX_TABLE-",
+    col_widths=[44, 14, 10, 10],
+    auto_size_columns=False,
+    justification="left",
+    font=FONT_TEXT,
+    header_font=FONT_LABEL,
+    expand_x=True,
+    expand_y=True,
+    num_rows=10,
+    enable_events=True,
+    select_mode=sg.TABLE_SELECT_MODE_EXTENDED,
+    background_color="#0d1117",
+    text_color="#c9d1d9",
+    alternating_row_color="#161b22",
+)
+
+fixer_out_row = [
+    sg.Text("Output Folder:", size=(13, 1), font=FONT_LABEL),
+    sg.InputText("", key="-FIX_OUTDIR-", expand_x=True, font=FONT_TEXT,
+                 tooltip="Leave empty to save next to each source file"),
+    sg.FolderBrowse("Browse", button_color=("white", "#30363d"), font=FONT_TEXT, size=(8, 1)),
+    sg.Text("Suffix:", font=FONT_LABEL),
+    sg.InputText("_fixed", key="-FIX_SUFFIX-", size=(10, 1), font=FONT_TEXT),
+]
+
+fixer_actions_row = [
+    sg.Button("  Check All  ", key="-FIX_CHECK-", button_color=("white", "#1f6feb"), font=FONT_BTN, size=(13, 1), pad=((0, 6), (0, 0))),
+    sg.Button("  Fix Needed  ", key="-FIX_RUN-", button_color=("white", "#238636"), font=FONT_BTN, size=(13, 1), pad=((0, 6), (0, 0))),
+    sg.Button("  Stop  ", key="-FIX_STOP-", disabled=True, button_color=("white", "#da3633"), font=FONT_BTN, size=(9, 1), pad=((0, 6), (0, 0))),
+    sg.Push(),
+    sg.Text("0/0", key="-FIX_COUNTER-", font=FONT_BTN, text_color="#8b949e"),
+    sg.ProgressBar(100, orientation="h", key="-FIX_PROG-", size=(20, 14),
+                   bar_color=("#238636", "#30363d"), pad=((6, 0), (0, 0))),
+]
+
+fixer_tab_layout = [
+    fixer_files_btns,
+    [fixer_table],
+    fixer_out_row,
+    fixer_actions_row,
+]
+
+# ---------------- Shared log frame (below TabGroup) ----------------
+
 log_frame = [
     [
         sg.Multiline(
@@ -697,6 +895,8 @@ log_frame = [
     ]
 ]
 
+# ---------------- Top-level layout ----------------
+
 layout = [
     [
         sg.Column([
@@ -708,9 +908,17 @@ layout = [
                      font=FONT_SUBTITLE, text_color="#8b949e", pad=((0, 0), (0, 4)))]
         ], pad=((0, 0), (0, 4)))
     ],
-    [sg.Frame(" Directories ", folder_frame, font=FONT_LABEL, expand_x=True, pad=((0, 0), (0, 6)))],
-    [sg.Frame(" Movies / Episodes & Cut Intervals ", cut_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
-    actions_row,
+    [
+        sg.TabGroup(
+            [[
+                sg.Tab("Cutter", cutter_tab_layout, font=FONT_LABEL),
+                sg.Tab("Fixer", fixer_tab_layout, font=FONT_LABEL),
+            ]],
+            expand_x=True,
+            expand_y=True,
+            key="-TABS-"
+        )
+    ],
     [sg.Frame(" Live Process Log ", log_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (6, 0)))]
 ]
 
@@ -748,6 +956,12 @@ else:
 # ---------------- Main Event Loop ----------------
 
 worker_thread: Optional[threading.Thread] = None
+fixer_worker_thread: Optional[threading.Thread] = None
+
+# Fixer state: parallel lists — fixer_paths[i] is the full path,
+# fixer_rows[i] is [basename, status, vcodec, duration] shown in the table.
+fixer_paths: List[str] = []
+fixer_rows: List[List[str]] = []
 
 while True:
     event, values = window.read(timeout=100)
@@ -761,6 +975,10 @@ while True:
                     pass
         break
 
+    # ------------------------------------------------------------------ #
+    #  Shared / Cutter events                                              #
+    # ------------------------------------------------------------------ #
+
     if event == "-CLR-":
         window["-LOG-"].update("")
 
@@ -772,6 +990,8 @@ while True:
     if event == "-PROCESSING_DONE-":
         window["-RUN-"].update(disabled=False)
         window["-STOP-"].update(disabled=True)
+        window["-FIX_CHECK-"].update(disabled=False)
+        window["-FIX_RUN-"].update(disabled=False)
         window["-STATUS-"].update("Idle" if not cancel_requested else "Stopped")
 
     if event == "-STOP-":
@@ -812,6 +1032,8 @@ while True:
         window["-RUN-"].update(disabled=True)
         window["-STOP-"].update(disabled=False)
         window["-STATUS-"].update("Running")
+        window["-FIX_CHECK-"].update(disabled=True)
+        window["-FIX_RUN-"].update(disabled=True)
 
         worker_thread = threading.Thread(
             target=processing_worker,
@@ -819,5 +1041,172 @@ while True:
             daemon=True
         )
         worker_thread.start()
+
+    # ------------------------------------------------------------------ #
+    #  Fixer events                                                        #
+    # ------------------------------------------------------------------ #
+
+    if event == "-FIX_ADD_FILES-":
+        new_files = sg.popup_get_file(
+            "Select video files", multiple_files=True,
+            file_types=(
+                ("Video Files", "*.mp4 *.m4v *.mov *.mkv *.avi *.ts *.webm"),
+                ("All Files", "*.*"),
+            ),
+            no_window=False,
+            title="Add Files"
+        )
+        if new_files:
+            if isinstance(new_files, str):
+                new_files = new_files.split(";")
+            for f in new_files:
+                f = f.strip()
+                if f and f not in fixer_paths:
+                    fixer_paths.append(f)
+                    fixer_rows.append([os.path.basename(f), "unknown", "?", "?"])
+            window["-FIX_TABLE-"].update(values=fixer_rows)
+
+    if event == "-FIX_ADD_FOLDER-":
+        folder = sg.popup_get_folder("Select folder with video files", title="Add Folder")
+        if folder:
+            exts = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".ts", ".webm"}
+            for name in sorted(os.listdir(folder)):
+                if os.path.splitext(name)[1].lower() in exts:
+                    full = os.path.join(folder, name)
+                    if full not in fixer_paths:
+                        fixer_paths.append(full)
+                        fixer_rows.append([os.path.basename(full), "unknown", "?", "?"])
+            window["-FIX_TABLE-"].update(values=fixer_rows)
+
+    if event == "-FIX_REMOVE-":
+        sel = values.get("-FIX_TABLE-", [])
+        if sel:
+            for idx in sorted(sel, reverse=True):
+                if 0 <= idx < len(fixer_paths):
+                    fixer_paths.pop(idx)
+                    fixer_rows.pop(idx)
+            window["-FIX_TABLE-"].update(values=fixer_rows)
+
+    if event == "-FIX_CLEAR-":
+        fixer_paths.clear()
+        fixer_rows.clear()
+        window["-FIX_TABLE-"].update(values=fixer_rows)
+        window["-FIX_COUNTER-"].update("0/0")
+        window["-FIX_PROG-"].update(0)
+
+    if event == "-FIX_CHECK-":
+        if not fixer_paths:
+            sg.popup("No files added to the Fixer list.")
+        elif fixer_worker_thread and fixer_worker_thread.is_alive():
+            sg.popup("Fixer is already running.")
+        else:
+            cancel_requested = False
+            window["-FIX_CHECK-"].update(disabled=True)
+            window["-FIX_RUN-"].update(disabled=True)
+            window["-FIX_STOP-"].update(disabled=False)
+            window["-RUN-"].update(disabled=True)
+            window["-STATUS-"].update("Checking...")
+            fixer_worker_thread = threading.Thread(
+                target=fixer_check_worker,
+                args=(list(fixer_paths), window),
+                daemon=True
+            )
+            fixer_worker_thread.start()
+
+    if event == "-FIX_RUN-":
+        if not fixer_paths:
+            sg.popup("No files added to the Fixer list.")
+        elif fixer_worker_thread and fixer_worker_thread.is_alive():
+            sg.popup("Fixer is already running.")
+        else:
+            outdir = values.get("-FIX_OUTDIR-", "").strip()
+            suffix = values.get("-FIX_SUFFIX-", "_fixed").strip()
+
+            # Guard: empty suffix + output dir == source dir would overwrite source.
+            if not suffix:
+                blocked = False
+                for p in fixer_paths:
+                    src_dir = os.path.normcase(os.path.abspath(os.path.dirname(p)))
+                    out_dir_check = (os.path.normcase(os.path.abspath(outdir))
+                                     if outdir else src_dir)
+                    if src_dir == out_dir_check:
+                        blocked = True
+                        break
+                if blocked:
+                    sg.popup_error(
+                        "Suffix is empty and output folder is the same as the source folder.\n"
+                        "This would overwrite the source files.\n"
+                        "Please set a suffix or choose a different output folder.",
+                        title="Would Overwrite Source"
+                    )
+                    continue
+
+            jobs = [p for p, r in zip(fixer_paths, fixer_rows) if r[1] == "needs-fix"]
+            if not jobs:
+                sg.popup("No files with status 'needs-fix'. Run 'Check All' first.")
+                continue
+
+            cancel_requested = False
+            window["-FIX_CHECK-"].update(disabled=True)
+            window["-FIX_RUN-"].update(disabled=True)
+            window["-FIX_STOP-"].update(disabled=False)
+            window["-RUN-"].update(disabled=True)
+            window["-STATUS-"].update("Fixing...")
+            window["-FIX_PROG-"].update(0)
+            window["-FIX_COUNTER-"].update(f"0/{len(jobs)}")
+            fixer_worker_thread = threading.Thread(
+                target=fixer_fix_worker,
+                args=(jobs, outdir, suffix, window),
+                daemon=True
+            )
+            fixer_worker_thread.start()
+
+    if event == "-FIX_STOP-":
+        cancel_requested = True
+        with process_lock:
+            if current_process and current_process.poll() is None:
+                try:
+                    current_process.kill()
+                    window["-LOG-"].print("[STOP] Fixer subprocess killed by user.")
+                except Exception as ex:
+                    window["-LOG-"].print(f"[STOP] Error killing fixer process: {ex}")
+        window["-FIX_STOP-"].update(disabled=True)
+        window["-STATUS-"].update("Stopping...")
+
+    if event == "-FIX_FILE_STATUS-":
+        data = values.get("-FIX_FILE_STATUS-")
+        if data and isinstance(data, dict):
+            path = data.get("path")
+            new_status = data.get("status")
+            new_vcodec = data.get("vcodec")
+            new_dur = data.get("duration")
+            if path in fixer_paths:
+                idx = fixer_paths.index(path)
+                if new_status is not None:
+                    fixer_rows[idx][1] = new_status
+                if new_vcodec is not None:
+                    fixer_rows[idx][2] = new_vcodec
+                if new_dur is not None:
+                    fixer_rows[idx][3] = new_dur
+            window["-FIX_TABLE-"].update(values=fixer_rows)
+            total = data.get("total", 0)
+            cur = data.get("index", 0) + 1
+            window["-FIX_COUNTER-"].update(f"{cur}/{total}")
+
+    if event == "-FIX_PROG-":
+        pct = values.get("-FIX_PROG-", 0)
+        window["-FIX_PROG-"].update(pct)
+
+    if event == "-FIX_COUNTER-":
+        txt = values.get("-FIX_COUNTER-", "")
+        window["-FIX_COUNTER-"].update(txt)
+
+    if event == "-FIX_DONE-":
+        window["-FIX_CHECK-"].update(disabled=False)
+        window["-FIX_RUN-"].update(disabled=False)
+        window["-FIX_STOP-"].update(disabled=True)
+        window["-RUN-"].update(disabled=False)
+        window["-STATUS-"].update("Idle" if not cancel_requested else "Stopped")
+        window["-FIX_PROG-"].update(0)
 
 window.close()
