@@ -1,241 +1,325 @@
 #!/usr/bin/env python3
 """
-fixer.py - detect MP4 files whose index (moov) is at the end and remux them
-with +faststart (no re-encoding), so phones start playback immediately.
+fixer.py - AI-assisted video inspection, repair, and encoding for Windows.
 
 CLI:
     python fixer.py E04.mp4 E18.mp4
     python fixer.py "C:\\Videos" --outdir "C:\\Videos\\fixed" --suffix _fixed
     python fixer.py E04.mp4 --check-only
+    python fixer.py E04.mp4 --profile phone_compatible --ai
 
-From the GUI (worker thread):
-    from fixer import fix_faststart, check_file
+From SceneTrim or other scripts:
+    from fixer import fix_faststart, check_file, probe, has_faststart
 """
 
 import argparse
-import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from src.ai_analyzer import query_gemini_diagnostics, validate_and_apply_ai_recommendation
+from src.config import PROFILES, EncodingProfile, config, resolve_binary
+from src.logging_config import logger
+from src.media_analyzer import ClassificationResult, analyze_media
+from src.media_probe import (
+    MediaMetadata,
+    has_faststart,
+    probe_media,
+    top_level_atoms,
+)
+from src.processing import remux_file, transcode_file
+from src.verification import verify_output
+
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-VIDEO_EXTS = {".mp4", ".m4v", ".mov"}
+VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".ts", ".webm"}
+
+# Maintain binary variables for backward compatibility
+FFMPEG = config.ffmpeg_path
+FFPROBE = config.ffprobe_path
 
 
 def find_binary(name: str) -> Optional[str]:
-    base = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
-                           else os.path.abspath(__file__))
-    exe = f"{name}.exe" if sys.platform == "win32" else name
-    local = os.path.join(base, exe)
-    return local if os.path.isfile(local) else shutil.which(name)
+    """Find binary executable for backward compatibility."""
+    return resolve_binary(name, name.upper())
 
-
-FFMPEG = find_binary("ffmpeg")
-FFPROBE = find_binary("ffprobe")
-
-
-# ---------------- Atom scanning (no ffmpeg needed) ----------------
-
-def top_level_atoms(path: str) -> List[Tuple[str, int, int]]:
-    """Return [(name, offset, size)] for top-level MP4 atoms. Reads headers only."""
-    atoms = []
-    file_size = os.path.getsize(path)
-    with open(path, "rb") as f:
-        pos = 0
-        while pos + 8 <= file_size:
-            f.seek(pos)
-            header = f.read(8)
-            if len(header) < 8:
-                break
-            size, name = struct.unpack(">I4s", header)
-            if size == 1:                      # 64-bit size follows
-                size = struct.unpack(">Q", f.read(8))[0]
-            elif size == 0:                    # atom runs to end of file
-                size = file_size - pos
-            if size < 8:                       # corrupt header, stop
-                break
-            atoms.append((name.decode("latin-1"), pos, size))
-            pos += size
-    return atoms
-
-
-def has_faststart(path: str) -> Optional[bool]:
-    """True if moov comes before mdat, False if after, None if unknown."""
-    moov = mdat = None
-    for name, offset, _ in top_level_atoms(path):
-        if name == "moov" and moov is None:
-            moov = offset
-        elif name == "mdat" and mdat is None:
-            mdat = offset
-    if moov is None or mdat is None:
-        return None
-    return moov < mdat
-
-
-# ---------------- ffprobe ----------------
 
 def probe(path: str) -> Dict:
-    """Return duration, video info, audio presence and caption-stream count."""
-    if not FFPROBE:
-        raise RuntimeError("ffprobe not found")
-    res = subprocess.run(
-        [FFPROBE, "-v", "error", "-print_format", "json",
-         "-show_streams", "-show_format", path],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=CREATE_NO_WINDOW)
-    if res.returncode != 0:
-        raise RuntimeError(res.stderr.strip() or "ffprobe failed")
-    data = json.loads(res.stdout)
-    streams = data.get("streams", [])
-    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    """Return dictionary with duration, video info, audio presence and extra stream count.
+    Preserves exact backward-compatible dictionary structure for external callers.
+    """
+    meta = probe_media(path, ffprobe_bin=FFPROBE)
+    if meta.probe_error:
+        raise RuntimeError(meta.probe_error)
+
     return {
-        "duration": float(data.get("format", {}).get("duration") or 0.0),
-        "vcodec": video.get("codec_name"),
-        "profile": video.get("profile"),
-        "pix_fmt": video.get("pix_fmt"),
-        "has_audio": any(s.get("codec_type") == "audio" for s in streams),
-        "extra_streams": sum(1 for s in streams
-                             if s.get("codec_type") not in ("video", "audio")),
+        "duration": meta.duration,
+        "vcodec": meta.vcodec,
+        "profile": meta.profile,
+        "pix_fmt": meta.pix_fmt,
+        "has_audio": meta.has_audio,
+        "extra_streams": meta.extra_streams,
     }
 
 
 def phone_compatible(info: Dict) -> bool:
-    return (info["vcodec"] == "h264"
-            and info["pix_fmt"] == "yuv420p"
-            and (info["profile"] or "").split()[0] in
-            ("Baseline", "Constrained", "Main", "High"))
+    """Backward compatible check for standard H.264 mobile compatibility."""
+    return (
+        info.get("vcodec") == "h264"
+        and info.get("pix_fmt") == "yuv420p"
+        and (info.get("profile") or "").split()[0]
+        in ("Baseline", "Constrained", "Main", "High")
+    )
 
 
 def check_file(path: str) -> Dict:
-    """Quick status for the GUI list."""
-    info = probe(path)
-    fast = has_faststart(path)
-    if fast is None:
-        status = "unknown"
-    elif fast:
-        status = "ok" if phone_compatible(info) else "needs-reencode"
-    else:
-        status = "needs-fix"
-    return {"status": status, "faststart": fast, **info}
-
-
-# ---------------- Fix ----------------
-
-def fix_faststart(src: str, dst: str,
-                  on_progress: Optional[Callable[[float], None]] = None,
-                  cancel: Callable[[], bool] = lambda: False,
-                  on_process: Optional[Callable[["subprocess.Popen"], None]] = None) -> bool:
-    """Remux src -> dst with +faststart. Video + audio only (drops c608/subtitle
-    streams). Writes to a temp file first and renames only on success.
-
-    on_process(proc) is called immediately after the Popen starts, before
-    reading stdout. Use it to register the process for external cancellation.
+    """Status assessment for GUI lists and quick CLI checks.
+    Preserves legacy status strings ('ok', 'needs-reencode', 'needs-fix', 'unknown')
+    while populating full metadata.
     """
-    if not FFMPEG:
-        raise RuntimeError("ffmpeg not found")
-    info = probe(src)
-    total = info["duration"] or 0.0
+    meta = probe_media(path, ffprobe_bin=FFPROBE)
+    fast = meta.has_faststart
 
-    out_dir = os.path.dirname(os.path.abspath(dst))
-    os.makedirs(out_dir, exist_ok=True)
-    need = os.path.getsize(src) * 1.05
-    if shutil.disk_usage(out_dir).free < need:
-        raise RuntimeError("Not enough free disk space for the output file")
+    analysis = analyze_media(meta, profile=PROFILES["phone_compatible"])
+    # Map modern classification to legacy status codes if needed
+    if meta.probe_error:
+        status = "unknown"
+    elif analysis.status == "needs-transcode":
+        status = "needs-reencode"
+    elif analysis.status == "needs-remux":
+        status = "needs-fix"
+    elif analysis.status == "ok":
+        status = "ok"
+    else:
+        status = "unknown"
 
-    tmp = dst + ".part.mp4"
-    cmd = [FFMPEG, "-y", "-nostdin", "-v", "error", "-nostats",
-           "-progress", "pipe:1",
-           "-i", src, "-map", "0:v", "-map", "0:a?",
-           "-c", "copy", "-movflags", "+faststart", tmp]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace",
-                            creationflags=CREATE_NO_WINDOW)
-
-    # Notify caller about the Popen object so it can register it for kill.
-    if on_process is not None:
-        on_process(proc)
-
-    try:
-        for line in proc.stdout:
-            if cancel():
-                proc.kill()
-                break
-            if line.startswith(("out_time_us=", "out_time_ms=")) and total > 0 and on_progress:
-                try:
-                    secs = int(line.split("=")[1]) / 1_000_000
-                    on_progress(min(secs / total, 1.0))
-                except ValueError:
-                    pass
-        proc.wait()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-
-    ok = proc.returncode == 0 and os.path.exists(tmp)
-    if ok and not cancel():
-        ok = verify(src, tmp)
-    if ok and not cancel():
-        os.replace(tmp, dst)
-        if on_progress:
-            on_progress(1.0)
-        return True
-    if os.path.exists(tmp):
-        os.remove(tmp)
-    return False
+    info = meta.to_dict()
+    return {
+        "status": status,
+        "faststart": fast,
+        "detailed_status": analysis.status,
+        "reasons": analysis.reasons,
+        "action": analysis.action,
+        **info,
+    }
 
 
 def verify(src: str, out: str, tolerance: float = 1.0) -> bool:
-    """moov must be first and duration must match the source."""
-    if has_faststart(out) is not True:
+    """Verify that moov is first and duration matches within tolerance."""
+    src_meta = probe_media(src, ffprobe_bin=FFPROBE)
+    res = verify_output(
+        src_meta=src_meta,
+        out_path=out,
+        profile=PROFILES["phone_compatible"],
+        tolerance=tolerance,
+        run_decode=True,
+    )
+    return res.is_valid
+
+
+def fix_faststart(
+    src: str,
+    dst: str,
+    on_progress: Optional[Callable[[float], None]] = None,
+    cancel: Callable[[], bool] = lambda: False,
+    on_process: Optional[Callable[[subprocess.Popen], None]] = None,
+) -> bool:
+    """Remux src -> dst with +faststart.
+    Writes to a temporary file first and atomically renames only on verified success.
+    """
+    # Sync binaries in case external caller modified module attributes
+    config.ffmpeg_path = FFMPEG
+    config.ffprobe_path = FFPROBE
+
+    try:
+        meta = probe_media(src, ffprobe_bin=FFPROBE)
+        tmp = remux_file(
+            src=src,
+            dst=dst,
+            meta=meta,
+            on_progress=on_progress,
+            cancel=cancel,
+            on_process=on_process,
+        )
+
+        # Verification
+        v_res = verify_output(
+            src_meta=meta,
+            out_path=str(tmp),
+            profile=PROFILES["phone_compatible"],
+        )
+        if v_res.is_valid and not cancel():
+            tmp.replace(dst)
+            if on_progress:
+                on_progress(1.0)
+            return True
+
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
         return False
-    return abs(probe(src)["duration"] - probe(out)["duration"]) <= tolerance
+
+    except Exception as e:
+        logger.error("fix_faststart failed for %s: %s", src, e)
+        return False
 
 
-# ---------------- CLI ----------------
+def transcode_to_compatible(
+    src: str,
+    dst: str,
+    profile: Optional[EncodingProfile] = None,
+    on_progress: Optional[Callable[[float], None]] = None,
+    cancel: Callable[[], bool] = lambda: False,
+    on_process: Optional[Callable[[subprocess.Popen], None]] = None,
+) -> bool:
+    """Transcode src -> dst according to profile.
+    Writes to a temporary file first and atomically renames only on verified success.
+    """
+    config.ffmpeg_path = FFMPEG
+    config.ffprobe_path = FFPROBE
+
+    try:
+        meta = probe_media(src, ffprobe_bin=FFPROBE)
+        target_profile = profile or PROFILES["phone_compatible"]
+        tmp = transcode_file(
+            src=src,
+            dst=dst,
+            meta=meta,
+            profile=target_profile,
+            on_progress=on_progress,
+            cancel=cancel,
+            on_process=on_process,
+        )
+
+        v_res = verify_output(
+            src_meta=meta,
+            out_path=str(tmp),
+            profile=target_profile,
+        )
+        if v_res.is_valid and not cancel():
+            tmp.replace(dst)
+            if on_progress:
+                on_progress(1.0)
+            return True
+
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        return False
+
+    except Exception as e:
+        logger.error("transcode_to_compatible failed for %s: %s", src, e)
+        return False
+
 
 def collect(paths: List[str]) -> List[str]:
+    """Collect all valid media files from list of files and folders."""
     files = []
     for p in paths:
         if os.path.isdir(p):
-            for name in sorted(os.listdir(p)):
-                if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
-                    files.append(os.path.join(p, name))
+            for root, _, filenames in os.walk(p):
+                for name in sorted(filenames):
+                    if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                        files.append(os.path.join(root, name))
         elif os.path.isfile(p):
             files.append(p)
     return files
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fix MP4 files for phone playback (faststart).")
-    ap.add_argument("paths", nargs="+", help="files or folders")
-    ap.add_argument("--outdir", help="output folder (default: next to source)")
-    ap.add_argument("--suffix", default="_fixed")
-    ap.add_argument("--check-only", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="AI-Assisted Video Fixer & Transcoder for Windows."
+    )
+    ap.add_argument("paths", nargs="+", help="One or more video files or folders")
+    ap.add_argument("--outdir", help="Output directory (default: next to source)")
+    ap.add_argument("--suffix", default="_fixed", help="Filename suffix for output")
+    ap.add_argument("--check-only", action="store_true", help="Inspect and report status without processing")
+    ap.add_argument(
+        "--profile",
+        default="phone_compatible",
+        choices=list(PROFILES.keys()),
+        help="Target compatibility profile",
+    )
+    ap.add_argument("--ai", action="store_true", help="Enable Gemini AI diagnostic analysis")
+    ap.add_argument("--remux-only", action="store_true", help="Force remux only (skip transcoding)")
     args = ap.parse_args()
 
-    if not FFMPEG or not FFPROBE:
-        sys.exit("ffmpeg/ffprobe not found (PATH or next to fixer.py)")
+    global FFMPEG, FFPROBE
+    FFMPEG = config.ffmpeg_path
+    FFPROBE = config.ffprobe_path
 
-    for src in collect(args.paths):
+    if not FFMPEG or not FFPROBE:
+        sys.exit("Error: FFmpeg/FFprobe binaries not found on PATH or next to executable.")
+
+    files = collect(args.paths)
+    if not files:
+        print("No valid video files found in specified paths.")
+        return
+
+    profile = PROFILES.get(args.profile, PROFILES["phone_compatible"])
+    print(f"\nTarget profile: {profile.name} ({profile.description})")
+    print(f"Discovered {len(files)} file(s) for processing.\n" + "=" * 60)
+
+    for src in files:
         try:
-            info = check_file(src)
+            meta = probe_media(src, ffprobe_bin=FFPROBE)
+            analysis = analyze_media(meta, profile=profile)
+
+            ai_advice = ""
+            if args.ai:
+                ai_rec, _ = query_gemini_diagnostics(meta, analysis)
+                if ai_rec:
+                    analysis = validate_and_apply_ai_recommendation(ai_rec, analysis)
+                    ai_advice = f" | AI: {ai_rec.action} ({ai_rec.confidence * 100:.0f}%)"
+
+            print(
+                f"[{analysis.status.upper():<16}] {os.path.basename(src)}  "
+                f"({meta.vcodec}/{meta.pix_fmt}, {meta.duration:.1f}s){ai_advice}"
+            )
+            if analysis.reasons:
+                for r in analysis.reasons:
+                    print(f"   -> {r}")
+
+            if args.check_only:
+                continue
+
+            if analysis.status == "ok":
+                print("   Status is already OK. Skipping.\n")
+                continue
+
+            if analysis.status in ("corrupt", "unknown"):
+                print("   File cannot be safely processed automatically. Skipping.\n")
+                continue
+
+            # Determine destination path
+            stem, ext = os.path.splitext(os.path.basename(src))
+            out_folder = args.outdir or os.path.dirname(os.path.abspath(src))
+            dst = os.path.join(out_folder, f"{stem}{args.suffix}.{profile.target_container}")
+
+            if os.path.abspath(src) == os.path.abspath(dst):
+                print("   ERROR: Source and destination paths are identical. Skipping.\n")
+                continue
+
+            # Process based on required action
+            progress_fn = lambda p: print(f"\r   Progress: {p * 100:5.1f}%", end="", flush=True)
+
+            if analysis.action == "remux" or args.remux_only:
+                print(f"   Remuxing (+faststart)...")
+                ok = fix_faststart(src, dst, on_progress=progress_fn)
+            elif analysis.action == "transcode":
+                print(f"   Transcoding to {profile.name}...")
+                ok = transcode_to_compatible(src, dst, profile=profile, on_progress=progress_fn)
+            else:
+                print(f"   Action '{analysis.action}' requires manual review. Skipping.")
+                continue
+
+            if ok:
+                print(f"\n   [SUCCESS] Saved to: {dst}\n")
+            else:
+                print(f"\n   [FAILED] Could not verify or process file.\n")
+
         except Exception as e:
-            print(f"[ERR ] {src}: {e}")
-            continue
-        print(f"[{info['status']:<13}] {os.path.basename(src)}  "
-              f"({info['vcodec']}/{info['pix_fmt']}, {info['duration']:.0f}s)")
-        if args.check_only or info["status"] != "needs-fix":
-            continue
-        stem, ext = os.path.splitext(os.path.basename(src))
-        dst = os.path.join(args.outdir or os.path.dirname(os.path.abspath(src)),
-                           f"{stem}{args.suffix}{ext}")
-        ok = fix_faststart(
-            src, dst,
-            on_progress=lambda p: print(f"\r   {p*100:5.1f}%", end="", flush=True))
-        print("\n   done ->" if ok else "\n   FAILED", dst if ok else "")
+            print(f"[ERR ] {src}: {e}\n")
 
 
 if __name__ == "__main__":

@@ -3,11 +3,24 @@
 __pycache__/
 *.pyc
 
+# Environment files
+.env
+*.env.local
+!.env.example
+
 # PyInstaller build artifacts
 build/
 dist/
 *.spec
 
+# Logs and temp files
+*.log
+scenetrim_parts/
+*.part.mp4
+*.part.*
+.pytest_cache/
+
 # Release packages
 SceneTrim_release/
+VideoFixer_release/
 *.zip

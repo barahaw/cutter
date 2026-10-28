@@ -1,342 +1,250 @@
-# SceneTrim
+# AI-Powered Video Fixer for Windows
 
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)](https://microsoft.com/windows)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![GUI](https://img.shields.io/badge/GUI-FreeSimpleGUI-orange.svg)](https://github.com/spyoungtech/FreeSimpleGUI)
-[![FFmpeg](https://img.shields.io/badge/Engine-FFmpeg-red.svg)](https://ffmpeg.org/)
-[![Author](https://img.shields.io/badge/Author-Baraa%20Hawamdeh-informational.svg)](https://github.com/baraa-hawamdeh)
+[![Engine](https://img.shields.io/badge/Engine-FFmpeg%209.0-red.svg)](https://ffmpeg.org/)
+[![AI](https://img.shields.io/badge/AI-Google%20Gemini-blueviolet.svg)](https://aistudio.google.com/)
 
-A modern, high-performance desktop application for Windows designed to automatically cut, trim, and remove unwanted scenes or intervals from batches of video files using **FFmpeg**. It also includes a **Fixer** tool that repairs MP4 files that keep "loading" on phones, without re-encoding.
+A reliable, AI-assisted video inspection, repair, and transcoding desktop application and CLI for Windows. It identifies container faults (such as the MP4 `moov` atom placed after `mdat`, causing endless buffering on mobile phones), detects codec and pixel format incompatibilities (HEVC, 10-bit color, unsupported audio tracks), and repairs or converts media files safely without overwriting source files.
 
-Built with a sleek dark-themed GUI in **FreeSimpleGUI**, SceneTrim supports hardware-accelerated GPU encoding via NVIDIA **NVENC** (`h264_nvenc`) with seamless automatic fallback to CPU (`libx264`).
+Powered by Google's official **Gemini API** (`google-genai` SDK) for intelligent diagnostics, the application features deterministic fallback logic so it functions seamlessly offline or without an API key.
 
 ---
 
 ## Table of Contents
 
-- [Features](#features)
-- [Quick Start (Portable EXE)](#quick-start-portable-exe)
-- [Running from Source (Python)](#running-from-source-python)
-- [Installing FFmpeg](#installing-ffmpeg)
-- [Usage Guide](#usage-guide)
-  - [Cutter Tab](#cutter-tab)
-  - [Fixer Tab](#fixer-tab)
-  - [Fixer from the Command Line](#fixer-from-the-command-line)
-- [How It Works](#how-it-works)
-- [Building the Standalone EXE](#building-the-standalone-exe)
-- [Packaging for Distribution](#packaging-for-distribution)
-- [Project Structure](#project-structure)
-- [Troubleshooting & FAQ](#troubleshooting--faq)
-- [Author](#author)
+1. [Features](#features)
+2. [Remuxing vs. Transcoding](#remuxing-vs-transcoding)
+3. [System Requirements](#system-requirements)
+4. [Installation & Python Setup](#installation--python-setup)
+5. [FFmpeg & FFprobe Setup](#ffmpeg--ffprobe-setup)
+6. [Gemini API Configuration & Security](#gemini-api-configuration--security)
+7. [Running in Development](#running-in-development)
+   - [Desktop GUI (`app.py`)](#desktop-gui-apppy)
+   - [Command-Line Interface (`fixer.py`)](#command-line-interface-fixerpy)
+8. [Automated Testing](#automated-testing)
+9. [Packaging Standalone Windows Executable](#packaging-standalone-windows-executable)
+10. [AI Recommendations & Safety Verification](#ai-recommendations--safety-verification)
+11. [Troubleshooting & FAQ](#troubleshooting--faq)
+12. [Licensing & Distribution Considerations](#licensing--distribution-considerations)
 
 ---
 
 ## Features
 
-### Cutter
-
-- **⚡ Hardware-Accelerated Encoding**: Automatically uses NVIDIA NVENC (`h264_nvenc`) for fast encoding, falling back to CPU (`libx264`) if the GPU encoder is unavailable or fails.
-- **✂️ Batch Scene Removal**: Define exact timestamps to remove per video in a simple, human-readable text box.
-- **🚀 Instant Phone Playback**: Final output files are written with `-movflags +faststart`, so the index is at the start of the file and players begin playback immediately.
-- **🛑 Subprocess & Cancel Control**: Stop running jobs at any moment; the running FFmpeg process is killed.
-- **🔄 Multi-Format Input**: Recursively discovers `.mp4`, `.mkv`, `.mov`, `.ts`, `.m4v`, `.avi`, and `.webm` files matching your episode names.
-
-### Fixer
-
-- **🔍 Detects slow-start MP4s**: Reads the top-level MP4 atoms and checks whether the `moov` atom (the file index) is stored after `mdat`. Files like this keep "loading" on phones because the player has to reach the end of the file first.
-- **🛠️ Lossless fix**: Remuxes with `-movflags +faststart` and stream copy. There is **no re-encoding**, so there is no quality loss and large files are processed quickly.
-- **🧹 Video + audio only**: Closed-caption and other subtitle streams are dropped from the output.
-- **📋 Status table**: Each file is shown as `ok`, `needs-fix`, `needs-reencode`, `unknown`, `fixing...`, `done`, `failed`, or `cancelled`.
-- **📦 Batch processing** with a progress bar for the current file, an overall counter, and a **Stop** button.
-- **🔒 Safe by design**: The source file is never overwritten. Output is written to a temporary `.part.mp4` file, verified (`moov` first, duration matches the source), and only then renamed.
-- **⚙️ Options**: Optional output folder (empty = next to the source) and a filename suffix (default `_fixed`).
-
-### General
-
-- **🎨 Sleek Modern GUI**: Dark interface (`Segoe UI` + `Consolas`) with two tabs (Cutter, Fixer) and a shared live process log.
-- **📦 Portable**: Runs as a standalone `.exe` without Python, with automatic discovery of `ffmpeg.exe` and `ffprobe.exe`.
+- **Automated MP4 Atom Scanning**: Directly parses MP4 container atoms (`top_level_atoms`) to verify if the index (`moov`) appears before the media data (`mdat`) for fast-start mobile streaming.
+- **Deep Technical Inspection**: Uses FFprobe to extract full video parameters (codec, profile, level, dimensions, frame rate, pixel format, 10-bit/HDR transfer characteristics), audio layouts (codecs, channels, sample rate), and subtitle streams.
+- **Intelligent Classification**: Distinguishes between `ok` (compatible), `needs-remux` (container or faststart fix only), `needs-transcode` (codec or color format incompatible), `corrupt` (unreadable packets/header), and `unknown`.
+- **Google Gemini 2.5 Integration**: Uses Google's modern `google-genai` SDK with strict JSON schemas to provide human-readable diagnostics and recommendations.
+- **Hard Safety Guardrails**: AI recommendations are strictly validated locally against deterministic technical constraints. Gemini is never permitted to execute arbitrary shell commands, invent metadata, override corruption detections, or downgrade required transcodes.
+- **Zero Quality-Loss Remuxing**: Whenever streams already match the target profile, stream copying (`-c copy`) is used with `-movflags +faststart`.
+- **High-Quality Compatible Transcoding**: Safe CRF-based software encoding (`libx264` + `aac`) ensures 100% playback compatibility across iOS, Android, and web media players.
+- **Multi-Stage Output Verification**: Confirms file non-emptiness, verifies metadata, tests duration tolerance, and executes an FFmpeg null-mux decode test (`-f null -`) to prove stream integrity.
+- **Source File Safety**: Never overwrites source files. Writes to atomic temporary parts (`.part_<uuid>.mp4`) and replaces only on complete verification pass.
+- **Responsive GUI**: Built with FreeSimpleGUI; background operations run in isolated worker threads with cancellation and live progress reporting.
 
 ---
 
-## Quick Start (Portable EXE)
+## Remuxing vs. Transcoding
 
-If you downloaded the pre-built release package (`SceneTrim_release.zip`), **no Python installation is required**:
+Understanding the difference between **Remuxing** and **Transcoding** is critical to efficient video processing:
 
-1. Extract `SceneTrim_release.zip`.
-2. Ensure the folder contains:
-   - `SceneTrim.exe`
-   - `ffmpeg.exe`
-   - `ffprobe.exe`
-3. Double-click `SceneTrim.exe` to launch the application.
+| Feature | Remuxing (`-c copy`) | Transcoding (`libx264` / `aac`) |
+| :--- | :--- | :--- |
+| **Operation** | Copies compressed video and audio packets directly into a new container without decoding. | Decompresses every video/audio frame and re-encodes it into a compatible codec. |
+| **Speed** | Extremely fast (limited only by disk read/write speed, typically 100-500+ MB/s). | Slower (CPU/GPU compute intensive, typically real-time to 5x speed). |
+| **Quality** | **100% Lossless**. The video data is bit-for-bit identical to the source. | Slight generational loss depending on CRF quality settings. |
+| **When Used** | When streams are already compatible (e.g. H.264 8-bit, AAC), but the MP4 index (`moov`) is misplaced, or container is MKV/MOV. | When the codec (e.g. HEVC/H.265, AV1, VP9), pixel format (10-bit `yuv420p10le`), or audio format is incompatible with target devices. |
+
+The application's deterministic analyzer always chooses **Remuxing** whenever safe, avoiding unnecessary transcoding to preserve time and quality.
 
 ---
 
-## Running from Source (Python)
+## System Requirements
 
-### Prerequisites
+- **Operating System**: Windows 10 or Windows 11 (64-bit).
+- **Python**: Python 3.10 to 3.13 (for development from source).
+- **Disk Space**: At least 500 MB free space for the application and temporary conversion files.
+- **FFmpeg**: FFmpeg 5.0+ and FFprobe (bundled automatically in the release package).
 
-- **Windows 10 / 11**
-- **Python 3.10+**
-- **FFmpeg & FFprobe** available on the system `PATH` (or placed next to the script).
+---
 
-### Step-by-Step Setup
+## Installation & Python Setup
 
-1. **Clone or navigate to the repository:**
-
-   ```powershell
-   git clone https://github.com/baraa-hawamdeh/SceneTrim.git
-   cd SceneTrim
+1. **Clone or Download the Repository**:
+   ```pwsh
+   cd C:\Users\HP\Desktop\PySimpleGUI-Project
    ```
 
-2. **Create and activate a virtual environment:**
-
-   ```powershell
+2. **Create and Activate Virtual Environment**:
+   ```pwsh
    python -m venv .venv
    .\.venv\Scripts\Activate.ps1
    ```
 
-3. **Install dependencies:**
-
-   ```powershell
-   pip install FreeSimpleGUI
+3. **Install Dependencies**:
+   ```pwsh
+   pip install -r requirements.txt
    ```
-
-4. **Launch the application:**
-
-   ```powershell
-   python SceneTrim.py
-   ```
-
-`fixer.py` must stay in the same folder as `SceneTrim.py`, because the Fixer tab imports it.
 
 ---
 
-## Installing FFmpeg
+## FFmpeg & FFprobe Setup
 
-If FFmpeg is not already installed on your system, install it using **WinGet**:
+The application automatically locates `ffmpeg` and `ffprobe` in the following order:
+1. Environment variables `FFMPEG` and `FFPROBE` (if set to valid file paths).
+2. Directly next to the running executable or script.
+3. In an `assets/bin/` subfolder.
+4. Current working directory.
+5. System `PATH`.
 
-```powershell
-winget install Gyan.FFmpeg
-```
-
-Restart your terminal and verify the installation:
-
-```powershell
+To verify your system FFmpeg installation:
+```pwsh
 ffmpeg -version
 ffprobe -version
 ```
 
-### Manual Binary Location (Optional)
-
-If FFmpeg is installed in a non-standard location and not in your `PATH`, you can set session environment variables:
-
-```powershell
-$env:FFMPEG  = "C:\path\to\ffmpeg\bin\ffmpeg.exe"
-$env:FFPROBE = "C:\path\to\ffmpeg\bin\ffprobe.exe"
+If not installed, download the official Windows build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) or install via winget:
+```pwsh
+winget install Gyan.FFmpeg
 ```
-
-Or simply copy `ffmpeg.exe` and `ffprobe.exe` into the same directory as `SceneTrim.py` / `SceneTrim.exe`.
 
 ---
 
-## Usage Guide
+## Gemini API Configuration & Security
 
-### Cutter Tab
+The application supports AI diagnostics powered by Google Gemini.
 
-**Input & Output Folders**
+1. **Get an API Key**:
+   Visit [Google AI Studio](https://aistudio.google.com/) and create a free API key.
 
-- **Input Folder**: the folder containing your source videos (subfolders are searched recursively).
-- **Output Folder**: the destination for trimmed videos. It must be different from the input folder, so originals can never be overwritten.
+2. **Configure `.env`**:
+   Copy `.env.example` to `.env` in the project root (or next to `VideoFixer.exe` in the release folder):
+   ```env
+   GEMINI_API_KEY=your_actual_api_key_here
+   GEMINI_MODEL=gemini-2.5-flash
+   AI_ENABLED=true
+   ```
 
-**Syntax & Timestamp Rules**
+### API Security Considerations
+> [!IMPORTANT]
+> - An external `.env` file is intended for personal and local workstation usage.
+> - **Never** commit `.env` into source control (it is ignored in `.gitignore`).
+> - Storing an API key in `.env` next to a distributed executable does **not** protect the key from extraction if shared with third parties.
+> - If distributing the application publicly, leave `GEMINI_API_KEY` blank and instruct users to provide their own personal API key in their local `.env`.
+> - If no key is provided, the application automatically switches to deterministic local analysis without failing.
 
-1. **First line of each block**: the video file name **without extension** (e.g., `E01` matches `E01.mp4`, `E01.mkv`, etc.).
-2. **Following lines**: the interval(s) to be **deleted**.
-3. **Supported time formats**:
-   - Seconds: `90-120`
-   - Minutes & seconds: `01:30-02:00`
-   - Hours, minutes & seconds: `01:15:30-01:20:00`
-4. **No cuts (passthrough)**: write `clear` under a name to copy the video without cutting.
-5. **Separation**: separate blocks with an **empty line**.
+---
 
-**Example Plan**
+## Running in Development
 
+### Desktop GUI (`app.py`)
+Launch the interactive graphical interface:
+```pwsh
+.\.venv\Scripts\python.exe app.py
+```
+- **Add Files / Add Folder**: Load files into the batch table.
+- **Inspect Files**: Probes all files and displays status, resolution, codecs, duration, and recommended action.
+- **Start Processing**: Executes remuxing or transcoding with live progress bar and non-blocking background threads.
+- **Cancel**: Gracefully terminates running FFmpeg subprocesses and cleans up partial files.
+- **Open Output Folder**: Opens the target destination directory in Windows Explorer.
+
+### Command-Line Interface (`fixer.py`)
+The CLI is fully backward compatible with scripts and external automation.
+
+```pwsh
+# Quick check of files without processing
+python fixer.py "C:\Videos\clip1.mp4" --check-only
+
+# Fix all files in a folder and write to a fixed directory
+python fixer.py "C:\Videos" --outdir "C:\Videos\repaired" --suffix _fixed
+
+# Use Gemini AI diagnostics
+python fixer.py "C:\Videos\clip1.mp4" --ai
+
+# Select a specific profile
+python fixer.py "C:\Videos\clip1.mp4" --profile high_quality_h264
+```
+
+---
+
+## Automated Testing
+
+The project includes a comprehensive test suite in `tests/` covering media probing, classification, remuxing, transcoding, verification, AI schema validation, safety overrides, and Unicode path handling.
+
+Synthetic media fixtures are generated dynamically via FFmpeg without relying on external copyrighted media.
+
+Run the test suite with:
+```pwsh
+.\.venv\Scripts\pytest.exe -v
+```
+
+---
+
+## Packaging Standalone Windows Executable
+
+The application includes an automated build script `build_exe.py` that utilizes PyInstaller to generate a self-contained release package:
+
+```pwsh
+.\.venv\Scripts\python.exe build_exe.py
+```
+
+### Build Output Structure
+The compiled package is placed in `dist/VideoFixer/`:
 ```text
-E01
-29:32-30:17
-44:22-45:15
-
-E02
-clear
-
-E03
-01:15-02:00
-17:33-17:42
+dist/VideoFixer/
+├── VideoFixer.exe          # Standalone Windows GUI executable
+├── ffmpeg.exe              # Bundled FFmpeg binary
+├── ffprobe.exe             # Bundled FFprobe binary
+├── .env.example            # Configuration template
+└── _internal/              # Packaged Python runtimes and libraries
 ```
 
-- `E01`: `29:32`-`30:17` and `44:22`-`45:15` are removed; the remaining parts are stitched together.
-- `E02`: copied without cutting.
-- `E03`: `01:15`-`02:00` and `17:33`-`17:42` are removed.
-
-Click **Run Cutter**. Progress and FFmpeg output stream into the **Live Process Log**.
-
-### Fixer Tab
-
-1. Add videos with **Add Files** or **Add Folder** (use **Remove Selected** or **Clear** to edit the list).
-2. Click **Check All**. Each file gets a status:
-   - `ok`: index is at the start and the video is H.264 / `yuv420p`. Nothing to fix.
-   - `needs-fix`: the `moov` atom is at the end. This is what the Fixer repairs.
-   - `needs-reencode`: the file is not H.264 / `yuv420p`, so a remux alone will not make it phone-friendly.
-   - `unknown`: the MP4 structure could not be determined.
-3. (Optional) Set an **Output Folder** and a **Suffix**. With an empty output folder, results are saved next to the source as `<name>_fixed.mp4`.
-4. Click **Fix Needed**. Only `needs-fix` files are processed. Use **Stop** to cancel at any time; the temporary `.part.mp4` file is deleted.
-
-Safety rules: the source is never overwritten, an existing output file is skipped with a warning, and an empty suffix combined with the source folder as the output is blocked.
-
-The Cutter and the Fixer cannot run at the same time.
-
-### Fixer from the Command Line
-
-`fixer.py` also works as a standalone script:
-
-```powershell
-# Check only (nothing is modified)
-python fixer.py video.mp4 --check-only
-
-# Fix a file (writes video_fixed.mp4 next to it)
-python fixer.py video.mp4
-
-# Fix a whole folder into another folder with a custom suffix
-python fixer.py "C:\Videos" --outdir "C:\Videos\fixed" --suffix _fixed
-```
-
-Options: `--outdir`, `--suffix` (default `_fixed`), `--check-only`. When a folder is given, `.mp4`, `.m4v`, and `.mov` files in it are processed. In CLI mode, `fixer.py` looks for `ffmpeg.exe` / `ffprobe.exe` next to the script and then in `PATH`.
+When frozen, `VideoFixer.exe` automatically looks for `.env`, `ffmpeg.exe`, and `ffprobe.exe` right next to itself in its base folder.
 
 ---
 
-## How It Works
+## AI Recommendations & Safety Verification
 
-### Cutter
+### How AI Recommendations are Validated
+1. **Privacy-Conscious Input**: Only technical stream metadata (codec name, resolution, audio channels, durations, atom status) is transmitted to the Gemini API. File paths, names, and video contents are never uploaded.
+2. **Strict Schema**: Responses are constrained via Pydantic to a schema containing `action` (`no_action`, `remux`, `transcode`, `manual_review`), `confidence` (0.0 to 1.0), and `reasoning`.
+3. **Hard Local Constraints**:
+   - If deterministic inspection detects file corruption, AI cannot downgrade it to `no_action` or `remux`.
+   - If video codec or pixel format is incompatible (e.g. HEVC or 10-bit), AI cannot force `remux` or `no_action`.
+   - If AI confidence is below 60%, deterministic fallback rules prevail.
 
-1. **Duration inspection** via `ffprobe`.
-2. **Inverted interval calculation**: the "keep" segments are computed by subtracting the unwanted ranges from the total duration.
-3. **Strategies, tried in order** until one succeeds:
-   1. A single `filter_complex` trim/concat pass with NVENC (`-c:v h264_nvenc -rc vbr -tune hq -cq 19 -b:v 0`), then CPU `libx264` (`-crf 18 -preset slow`).
-   2. Cutting each keep segment into a temporary part (stream copy, then NVENC, then CPU) and joining them with the concat demuxer.
-   3. Re-encoding the parts on CPU and joining them.
-   4. As a last resort, copying the original file.
-4. Final output files are written with `-movflags +faststart`.
-
-### Fixer
-
-1. `fixer.py` walks the top-level MP4 atoms (headers only, so it is instant even on multi-GB files) and compares the offsets of `moov` and `mdat`.
-2. `ffprobe` reads the codec, profile, pixel format, and duration.
-3. For `needs-fix` files, FFmpeg runs `-map 0:v -map 0:a? -c copy -movflags +faststart` into a temporary `.part.mp4` file. After the copy, FFmpeg does a second pass to move the index to the start of the file; progress sits at 100% during this step.
-4. The result is verified (`moov` before `mdat`, duration within 1 second of the source) and renamed to the final name. Free disk space is checked before starting.
-
----
-
-## Building the Standalone EXE
-
-```powershell
-pip install pyinstaller
-pyinstaller --noconsole --onefile --name SceneTrim SceneTrim.py
-```
-
-PyInstaller bundles `fixer.py` automatically because it is a normal import. The result is:
-
-```text
-dist\SceneTrim.exe
-```
-
-`ffmpeg.exe` and `ffprobe.exe` must be placed **next to `SceneTrim.exe`**. Do not use `--add-binary` with `--onefile`: the files would be extracted to a temporary folder where the app does not look for them.
-
-If your antivirus flags the one-file build, build with `--onedir` instead:
-
-```powershell
-pyinstaller --noconsole --onedir --name SceneTrim SceneTrim.py
-```
-
----
-
-## Packaging for Distribution
-
-To prepare a portable release bundle:
-
-```powershell
-# 1. Create release directory
-New-Item -ItemType Directory -Path "SceneTrim_release" -Force
-
-# 2. Copy the executable
-Copy-Item "dist\SceneTrim.exe" -Destination "SceneTrim_release\" -Force
-
-# 3. Copy FFmpeg binaries alongside the EXE
-Copy-Item "C:\path\to\ffmpeg.exe" -Destination "SceneTrim_release\" -Force
-Copy-Item "C:\path\to\ffprobe.exe" -Destination "SceneTrim_release\" -Force
-
-# 4. Create zip archive
-Compress-Archive -Path "SceneTrim_release" -DestinationPath "SceneTrim_release.zip" -Force
-```
-
-Use real `ffmpeg.exe` / `ffprobe.exe` files (for example from the Gyan.dev "essentials" build), not WinGet shortcut links.
-
----
-
-## Project Structure
-
-```text
-SceneTrim/
-├── SceneTrim.py        # Main application: GUI (Cutter + Fixer tabs) and cutting logic
-├── fixer.py            # MP4 faststart detector/fixer (used by the GUI, also a CLI)
-├── README.md           # Project documentation
-└── .gitignore          # Git ignore rules
-```
-
-Suggested `.gitignore`:
-
-```gitignore
-dist/
-build/
-*.spec
-ffmpeg.exe
-ffprobe.exe
-__pycache__/
-.venv/
-SceneTrim_release/
-SceneTrim_release.zip
-```
+### Multi-Stage Verification Pipeline
+Before any processed file is finalized:
+1. **File Existence & Size**: Ensures output exists and exceeds minimum byte threshold.
+2. **Container Fast-Start**: Validates top-level atoms to guarantee `moov` precedes `mdat`.
+3. **Stream Parity**: Probes output to confirm video and audio streams match target requirements.
+4. **Duration Tolerance**: Checks output duration matches source duration within $\pm 1.5\text{s}$.
+5. **Decode Null-Mux Test**: Runs `ffmpeg -v error -i <output> -t 10 -f null -` to verify frames decode cleanly without corruption.
+6. **Atomic Move**: Only after all checks pass is the temporary `.part` file moved into place.
 
 ---
 
 ## Troubleshooting & FAQ
 
-### A video keeps "loading" on my phone
+### 1. `ffprobe executable not found or not configured`
+Ensure `ffmpeg` and `ffprobe` are on your system `PATH` or placed directly in the same folder as `VideoFixer.exe` / `fixer.py`.
 
-The `moov` atom is probably at the end of the file. Open the **Fixer** tab, add the file, click **Check All**, and if it shows `needs-fix`, click **Fix Needed**. Copy the `_fixed` file to the phone and play it from local storage. Videos produced by the Cutter already include faststart.
+### 2. `GEMINI_API_KEY is not configured in .env`
+The application will operate normally in local deterministic mode. If you want AI explanations, copy `.env.example` to `.env` next to the executable and paste your key.
 
-### Fixer shows `needs-reencode`
+### 3. API Quota Exceeded or Network Error
+If the Gemini API reaches rate limits or network is unavailable, the application gracefully continues using local deterministic rules without interruption.
 
-The video is not H.264 with `yuv420p` (for example 10-bit or 4:2:2). Remuxing alone cannot fix this; the file has to be re-encoded.
-
-### "FFmpeg Not Found" or `[WinError 2] The system cannot find the file specified`
-
-SceneTrim searches for `ffmpeg.exe` and `ffprobe.exe` in:
-
-1. Environment variables `$env:FFMPEG` and `$env:FFPROBE`.
-2. Next to `SceneTrim.exe` / `SceneTrim.py`.
-3. The current working directory.
-4. System `PATH`.
-
-Place both files in the same folder as `SceneTrim.exe` to resolve this immediately.
-
-### The output video was not shortened
-
-Make sure the cut intervals are within the actual duration of the video. Ranges outside the duration are ignored, and if nothing needs cutting the original is copied.
-
-### Processing is slower on some computers
-
-With an NVIDIA GPU that supports NVENC, encoding is fast. Without one, SceneTrim falls back to `libx264` on the CPU, which gives high quality but takes longer.
+### 4. Closed Captions or Bitmap Subtitles Dropped
+MP4 containers only support text-based subtitles via the `mov_text` format. Bitmap subtitles (such as PGS from Blu-rays or VobSub from DVDs) cannot be stored in standard MP4 containers and are safely bypassed to prevent muxer crashes.
 
 ---
 
-Author: Baraa Hawamdeh
+## Licensing & Distribution Considerations
+
+- **FFmpeg**: FFmpeg is licensed under the GNU Lesser General Public License (LGPL) version 2.1 or later (or GPL depending on enabled options like `libx264`). When distributing FFmpeg binaries alongside your application:
+  - Do not link FFmpeg statically into proprietary code; invoke it as a separate external subprocess (as implemented here).
+  - Include FFmpeg's license documentation and attribution in your release package.
+- **SceneTrim & VideoFixer**: Project code is provided for video editing and repair workflows under standard open-source terms.
