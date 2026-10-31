@@ -86,6 +86,7 @@ APP_TITLE = f"SceneTrim — {AUTHOR}"
 current_process: Optional[subprocess.Popen] = None
 process_lock = threading.Lock()
 cancel_requested = False
+queue_worker_thread: Optional[threading.Thread] = None
 
 # ---------------- Utilities ----------------
 
@@ -283,6 +284,81 @@ def find_video(folder: str, name: str) -> str:
         if len(c) == 1:
             return c[0]
     return ""
+
+
+# ---- Queue helpers ----
+
+def _read_cuts_content(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _duration_declared(text: str) -> Optional[float]:
+    lines = text.splitlines()
+    if lines:
+        s = lines[0].strip()
+        if s.startswith("#"):
+            m = re.search(r"duration\s*=\s*([\d:.]+)", s, re.IGNORECASE)
+            if m:
+                try:
+                    return parse_time_to_seconds(m.group(1))
+                except Exception:
+                    return None
+    return None
+
+
+def _find_cuts_for_video(video_path: str, in_folder: str) -> Tuple[str, Optional[str]]:
+    """Return (cuts_source, text) where cuts_source in {sidecar, cuts.txt, none}."""
+    vid_dir = os.path.dirname(video_path)
+    sidecar = os.path.join(vid_dir, os.path.splitext(os.path.basename(video_path))[0] + ".cuts.txt")
+    if os.path.isfile(sidecar):
+        txt = _read_cuts_content(sidecar)
+        if txt is not None:
+            return ("sidecar", txt)
+    # cuts.txt in input folder
+    cuts_txt = os.path.join(in_folder, "cuts.txt") if in_folder else ""
+    if cuts_txt and os.path.isfile(cuts_txt):
+        txt = _read_cuts_content(cuts_txt)
+        if txt is not None:
+            episodes = parse_episodes_text(txt)
+            target = norm_name(os.path.splitext(os.path.basename(video_path))[0])
+            # match via find_video-style: if video basename stem in episodes keys
+            for key in episodes.keys():
+                if norm_name(key) == target:
+                    # build a single-block text by reusing: return parsed via synthetic
+                    return ("cuts.txt", txt)  # caller will filter
+    return ("none", None)
+
+
+def _safe_output_path(out_folder: str, rel: str, container: str, src_ext: str) -> str:
+    if container == "same as source":
+        ext = src_ext
+    else:
+        ext = ".mp4"
+    stem, _ = os.path.splitext(rel)
+    base = os.path.join(out_folder, stem + ext)
+    # keep subfolder structure already in rel
+    if not os.path.exists(base):
+        return base
+    i = 2
+    while True:
+        cand = os.path.join(out_folder, f"{stem} ({i}){ext}")
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+
+def is_within_folder(path: str, folder: str) -> bool:
+    """Safe containment check, including sources on another Windows drive."""
+    if not folder:
+        return False
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(folder)]) == os.path.abspath(folder)
+    except ValueError:
+        return False
 
 
 # ---------------- FFmpeg cutting strategies ----------------
@@ -498,7 +574,8 @@ def build_keep_segments(unwanted: List[Tuple[float, float]], duration: float) ->
 # ---------------- High-level processing per video ----------------
 
 def process_episode(input_folder: str, output_folder: str, ep_name: str,
-                    unwanted: List[Tuple[float, float]], window: sg.Window) -> Tuple[str, str]:
+                    unwanted: List[Tuple[float, float]], window: sg.Window,
+                    out_filename: Optional[str] = None) -> Tuple[str, str]:
     global cancel_requested
     if cancel_requested:
         return ep_name, "Cancelled"
@@ -514,7 +591,10 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str,
     duration = ffprobe_duration(found, window)
 
     safe_stem = re.sub(r'[<>:"/\\|?*]', "", os.path.splitext(os.path.basename(found))[0])
-    out_path = os.path.join(output_folder, f"{safe_stem}.mp4")
+    if out_filename:
+        out_path = os.path.join(output_folder, out_filename)
+    else:
+        out_path = os.path.join(output_folder, f"{safe_stem}.mp4")
     os.makedirs(output_folder, exist_ok=True)
 
     if duration <= 0:
@@ -601,6 +681,196 @@ def process_episode(input_folder: str, output_folder: str, ep_name: str,
     cmd = [FFMPEG, "-y", "-nostdin", "-i", found, "-c", "copy", "-movflags", "+faststart", out_path]
     rc = run_subprocess_live(cmd, window)
     return basename, "Fallback-Copy" if rc == 0 else "Failed"
+
+
+def set_cutter_job_controls(window: sg.Window, running: bool, status: str = "Idle") -> None:
+    """Keep all actions that could contend for ffmpeg disabled during a job."""
+    for key in ("-RUN-", "-Q_RUN_ALL-", "-Q_SCAN-", "-Q_ADD_FILES-", "-Q_REMOVE-",
+                "-Q_CLEAR-", "-LOAD_TXT-", "-SAVE_TXT-", "-FIX_ADD_FILES-", "-FIX_ADD_FOLDER-",
+                "-FIX_REMOVE-", "-FIX_CLEAR-", "-FIX_CHECK-", "-FIX_RUN-"):
+        window[key].update(disabled=running)
+    window["-STOP-"].update(disabled=not running)
+    window["-STATUS-"].update(status)
+
+
+def _run_queue_all(window, values, paths: Optional[List[str]] = None):
+    global cancel_requested, queue_worker_thread
+    out_folder = values.get("-OUT-", "").strip()
+    in_folder = values.get("-IN-", "").strip()
+    if not out_folder:
+        sg.popup("Please select output folder.")
+        return
+    if in_folder and os.path.normcase(os.path.abspath(in_folder)) == os.path.normcase(os.path.abspath(out_folder)):
+        sg.popup_error("Output folder must be different from input folder.")
+        return
+    keep_sub = bool(values.get("-Q_KEEP_SUB-", True))
+    container = values.get("-Q_CONTAINER-", "mp4")
+    move_done = bool(values.get("-Q_MOVE_DONE-", False))
+    # check ready count
+    ready = [p for p, m in queue_meta.items()
+             if m.get("status") == "Ready" and (paths is None or p in paths)]
+    if not ready:
+        sg.popup("No Ready rows to process.")
+        return
+    cancel_requested = False
+    set_cutter_job_controls(window, True, "Running queue")
+    queue_worker_thread = threading.Thread(
+        target=queue_run_all,
+        args=(out_folder, in_folder, keep_sub, container, move_done, window, ready), daemon=True)
+    queue_worker_thread.start()
+
+# ---------------- Queue worker helpers ----------------
+
+def collect_videos(folder: str) -> List[str]:
+    out = []
+    if not folder or not os.path.isdir(folder):
+        return out
+    for root, _, fs in os.walk(folder):
+        for f in fs:
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
+                out.append(os.path.join(root, f))
+    return sorted(out)
+
+
+def _parse_cuts_for_video(video_path: str, in_folder: str) -> Tuple[str, Optional[List[Tuple[float,float]]], Optional[float]]:
+    """Return (source, ranges_or_None, declared_duration_or_None)."""
+    vid_dir = os.path.dirname(video_path)
+    sidecar = os.path.join(vid_dir, os.path.splitext(os.path.basename(video_path))[0] + ".cuts.txt")
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    target = norm_name(stem)
+
+    def matching_ranges(text: str) -> Optional[List[Tuple[float, float]]]:
+        # Metadata comments are deliberately removed before handing the original
+        # grammar to parse_episodes_text; the parser itself remains unchanged.
+        episodes = parse_episodes_text("\n".join(
+            line for line in text.splitlines() if not line.strip().startswith("#")
+        ))
+        for key, ranges in episodes.items():
+            if norm_name(key) == target:
+                return list(ranges)
+        # Match the same safe unique-partial fallback used by find_video.
+        if len(target) >= 5:
+            candidates = [ranges for key, ranges in episodes.items()
+                          if target in norm_name(key)]
+            if len(candidates) == 1:
+                return list(candidates[0])
+        return None
+
+    if os.path.isfile(sidecar):
+        text = _read_cuts_content(sidecar)
+        if text is None:
+            return ("sidecar", None, None)
+        return ("sidecar", matching_ranges(text), _duration_declared(text))
+
+    cuts_txt = os.path.join(in_folder, "cuts.txt") if in_folder else ""
+    if cuts_txt and os.path.isfile(cuts_txt):
+        text = _read_cuts_content(cuts_txt)
+        if text is None:
+            return ("none", None, None)
+        ranges = matching_ranges(text)
+        if ranges is not None:
+            return ("cuts.txt", ranges, _duration_declared(text))
+        return ("none", None, _duration_declared(text))
+
+    return ("none", None, None)
+
+
+def queue_scan(in_folder: str, window: sg.Window, only_paths: Optional[List[str]] = None,
+               append: bool = False, watch: bool = False):
+    if only_paths is None and (not in_folder or not os.path.isdir(in_folder)):
+        window.write_event_value("-Q_SCAN_DONE-", {"rows": []})
+        return
+    rows = []
+    meta = {}
+    paths = only_paths if only_paths is not None else collect_videos(in_folder)
+    for vp in paths:
+        dur = ffprobe_duration(vp, window)
+        src, rngs, declared = _parse_cuts_for_video(vp, in_folder)
+        if src == "none" or rngs is None:
+            status = "No cuts"
+        elif dur <= 0:
+            # Do not allow process_episode's no-duration fallback to create an
+            # unverified output name. The user can rescan after fixing ffprobe.
+            status = "Failed"
+        elif declared is not None and dur > 0 and abs(declared - dur) > 2.0:
+            status = "Duration mismatch"
+        else:
+            status = "Ready"
+        disp_src = src if src != "none" else "none"
+        rows.append([os.path.basename(vp), f"{dur:.2f}s" if dur else "?", disp_src, status])
+        meta[vp] = {"dur": dur, "src": src, "ranges": rngs, "declared": declared,
+                    "status": status, "input_managed": True}
+        window.write_event_value("-LOG_LINE-", f"[SCAN] {vp} — {status} ({disp_src})")
+    window.write_event_value("-Q_SCAN_DONE-", {"rows": rows, "meta": meta,
+                             "paths": paths, "append": append, "watch": watch})
+
+
+def _unique_out_path(outdir: str, stem: str, ext: str) -> str:
+    base = os.path.join(outdir, f"{stem}{ext}")
+    if not os.path.exists(base):
+        return base
+    i = 2
+    while True:
+        cand = os.path.join(outdir, f"{stem} ({i}){ext}")
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+
+def queue_run_all(out_folder: str, in_folder: str, keep_sub: bool, container: str,
+                  move_done: bool, window: sg.Window, paths: Optional[List[str]] = None):
+    global cancel_requested
+    for path, m in list(queue_meta.items()):
+        if cancel_requested:
+            break
+        if paths is not None and path not in paths:
+            continue
+        if m.get("status") != "Ready":
+            continue
+        window.write_event_value("-Q_ROW_STATUS-", {"path": path, "status": "Running"})
+        rngs = m.get("ranges") or []
+        window.write_event_value("-LOG_LINE-", f"[QUEUE] Processing: {path}")
+        try:
+            if is_within_folder(path, in_folder):
+                rel = os.path.relpath(path, in_folder)
+            else:
+                rel = os.path.basename(path)
+            if not keep_sub:
+                rel = os.path.basename(path)
+            src_ext = os.path.splitext(path)[1]
+            if container == "same as source":
+                ext = src_ext
+            else:
+                ext = ".mp4"
+            stem = os.path.splitext(os.path.basename(rel))[0]
+            stem = re.sub(r'[<>:"/\\|?*]', "", stem)
+            outdir = os.path.join(out_folder, os.path.dirname(rel)) if keep_sub else out_folder
+            os.makedirs(outdir, exist_ok=True)
+            out_name = os.path.basename(_unique_out_path(outdir, stem, ext))
+            # process_episode writes into outdir as output_folder with out_filename=out_name
+            input_folder_for_find = os.path.dirname(path) or in_folder
+            basename, status = process_episode(input_folder_for_find, outdir, os.path.basename(path), rngs, window, out_filename=out_name)
+            ok = (status.startswith("Success") or status.startswith("Copied") or status.startswith("Fallback"))
+            if ok and move_done:
+                # Keep the input tree intact inside its single Done folder.
+                rel_for_done = os.path.relpath(path, in_folder) if is_within_folder(path, in_folder) else os.path.basename(path)
+                done_dir = (os.path.join(in_folder, "Done", os.path.dirname(rel_for_done))
+                            if in_folder else os.path.join(os.path.dirname(path), "Done"))
+                os.makedirs(done_dir, exist_ok=True)
+                try:
+                    done_stem, done_ext = os.path.splitext(os.path.basename(path))
+                    done_path = _unique_out_path(done_dir, done_stem, done_ext)
+                    shutil.move(path, done_path)
+                    window.write_event_value("-LOG_LINE-", f"[QUEUE] Moved original to Done: {path}")
+                except Exception as e:
+                    window.write_event_value("-LOG_LINE-", f"[WARN] Could not move to Done: {e}")
+            final_status = "Done" if ok else "Failed"
+            window.write_event_value("-LOG_LINE-", f"[QUEUE] {final_status}: {path} ({status})")
+            window.write_event_value("-Q_ROW_STATUS-", {"path": path, "status": final_status})
+        except Exception as e:
+            window.write_event_value("-LOG_LINE-", f"[ERROR] {path}: {e}")
+            window.write_event_value("-Q_ROW_STATUS-", {"path": path, "status": "Failed"})
+    window.write_event_value("-Q_RUN_DONE-", None)
 
 
 # ---------------- Cutter Worker Thread ----------------
@@ -765,7 +1035,7 @@ FONT_BTN = (FONT_FAMILY, 9, "bold")
 folder_frame = [
     [
         sg.Text("Input Folder:", size=(12, 1), font=FONT_LABEL),
-        sg.InputText(key="-IN-", expand_x=True, font=FONT_TEXT),
+        sg.InputText(key="-IN-", expand_x=True, font=FONT_TEXT, enable_events=True),
         sg.FolderBrowse("Browse", button_color=("white", "#30363d"), font=FONT_TEXT, size=(8, 1))
     ],
     [
@@ -808,6 +1078,53 @@ cut_frame = [
     ]
 ]
 
+# ---- Automated Queue for Cutter tab ----
+queue_opts_row = [
+    sg.Checkbox("Auto-scan on Input Folder change", key="-Q_AUTO_SCAN-", default=False, font=FONT_TEXT, pad=((0, 8), (0, 0)), enable_events=True),
+    sg.Checkbox("Auto-run after scan", key="-Q_AUTO_RUN-", default=False, font=FONT_TEXT, pad=((0, 8), (0, 0)), enable_events=True),
+    sg.Checkbox("Watch folder (s):", key="-Q_WATCH-", default=False, font=FONT_TEXT, pad=((0, 4), (0, 0)), enable_events=True),
+    sg.Spin([str(x) for x in range(5, 61)], initial_value="10", key="-Q_INTERVAL-", size=(5, 1), font=FONT_TEXT),
+]
+
+queue_output_opts_row = [
+    sg.Checkbox("Move original to Done", key="-Q_MOVE_DONE-", default=False, font=FONT_TEXT, pad=((8, 0), (0, 0))),
+    sg.Text("Container:", font=FONT_LABEL, pad=((8, 4), (0, 0))),
+    sg.Combo(["mp4", "same as source"], default_value="mp4", key="-Q_CONTAINER-", size=(14, 1), font=FONT_TEXT, readonly=True),
+    sg.Checkbox("Keep subfolder structure", key="-Q_KEEP_SUB-", default=True, font=FONT_TEXT, pad=((8, 0), (0, 0))),
+]
+
+queue_btns_row = [
+    sg.Button("Scan", key="-Q_SCAN-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(8, 1)),
+    sg.Button("Run All", key="-Q_RUN_ALL-", button_color=("white", "#238636"), font=FONT_BTN, size=(10, 1)),
+    sg.Button("Add Files", key="-Q_ADD_FILES-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(10, 1)),
+    sg.Button("Remove Selected", key="-Q_REMOVE-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(16, 1)),
+    sg.Button("Clear", key="-Q_CLEAR-", button_color=("white", "#da3633"), font=FONT_TEXT, size=(8, 1)),
+]
+
+queue_frame = [
+    queue_opts_row,
+    queue_output_opts_row,
+    queue_btns_row,
+    [sg.Table(
+        values=[],
+        headings=["File", "Duration", "Cuts source", "Status"],
+        key="-Q_TABLE-",
+        col_widths=[40, 12, 14, 24],
+        auto_size_columns=False,
+        justification="left",
+        font=FONT_TEXT,
+        header_font=FONT_LABEL,
+        expand_x=True,
+        expand_y=True,
+        num_rows=8,
+        enable_events=True,
+        select_mode=sg.TABLE_SELECT_MODE_EXTENDED,
+        background_color="#0d1117",
+        text_color="#c9d1d9",
+        alternating_row_color="#161b22",
+    )]
+]
+
 actions_row = [
     sg.Button("  Run Cutter  ", key="-RUN-", button_color=("white", "#238636"), font=FONT_BTN, size=(13, 1), pad=((0, 6), (0, 0))),
     sg.Button("  Stop  ", key="-STOP-", disabled=True, button_color=("white", "#da3633"), font=FONT_BTN, size=(9, 1), pad=((0, 6), (0, 0))),
@@ -817,9 +1134,23 @@ actions_row = [
     sg.Text("Idle", key="-STATUS-", font=FONT_BTN, text_color="#58a6ff", size=(12, 1))
 ]
 
+# ---- Queue runtime state ----
+queue_rows: List[List[str]] = []   # displayed rows: [File, Duration, source, Status]
+queue_meta: dict = {}            # path -> {dur, cuts_source, norm, source_path, rel, ...}
+
+def _scan_quiet_update(window):
+    pass
+
+cutter_txt_btns = [
+    sg.Button("Load .txt", key="-LOAD_TXT-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(10, 1), pad=((0, 6), (0, 0))),
+    sg.Button("Save .txt", key="-SAVE_TXT-", button_color=("white", "#30363d"), font=FONT_TEXT, size=(10, 1), pad=((0, 6), (0, 0))),
+]
+
 cutter_tab_layout = [
     [sg.Frame(" Directories ", folder_frame, font=FONT_LABEL, expand_x=True, pad=((0, 0), (0, 6)))],
+    cutter_txt_btns,
     [sg.Frame(" Movies / Episodes & Cut Intervals ", cut_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
+    [sg.Frame(" Queue ", queue_frame, font=FONT_LABEL, expand_x=True, expand_y=True, pad=((0, 0), (0, 6)))],
     actions_row,
 ]
 
@@ -931,6 +1262,18 @@ window = sg.Window(
     element_padding=(4, 4)
 )
 
+# ---------------- CLI cuts file support ----------------
+
+if len(sys.argv) > 1:
+    cli_path = sys.argv[1]
+    if cli_path.endswith(".txt") and os.path.isfile(cli_path):
+        try:
+            with open(cli_path, "r", encoding="utf-8-sig") as fh:
+                window["-TEXT-"].update(fh.read())
+            window["-LOG-"].print(f"[INFO] Loaded cuts file: {cli_path}")
+        except Exception as e:
+            window["-LOG-"].print(f"[ERROR] Failed to load cuts file: {e}")
+
 # ---------------- Initial Startup Checks ----------------
 missing_tools = []
 if not FFMPEG:
@@ -963,6 +1306,28 @@ fixer_worker_thread: Optional[threading.Thread] = None
 fixer_paths: List[str] = []
 fixer_rows: List[List[str]] = []
 
+# Queue runtime state
+queue_rows: List[List[str]] = []
+queue_meta: dict = {}
+last_in_folder = ""
+last_watch_time = 0.0
+watch_sizes: dict = {}
+watch_known: set = set()
+watch_enabled = False
+
+
+def refresh_queue_table() -> None:
+    """Render from metadata so each visible row always retains its source path."""
+    queue_rows[:] = []
+    for path, meta in queue_meta.items():
+        queue_rows.append([
+            os.path.basename(path),
+            f"{meta.get('dur', 0):.2f}s" if meta.get("dur", 0) else "?",
+            meta.get("src", "none"),
+            meta.get("status", "No cuts"),
+        ])
+    window["-Q_TABLE-"].update(values=queue_rows)
+
 while True:
     event, values = window.read(timeout=100)
     if event == sg.WIN_CLOSED:
@@ -988,11 +1353,7 @@ while True:
             window["-LOG-"].print(line)
 
     if event == "-PROCESSING_DONE-":
-        window["-RUN-"].update(disabled=False)
-        window["-STOP-"].update(disabled=True)
-        window["-FIX_CHECK-"].update(disabled=False)
-        window["-FIX_RUN-"].update(disabled=False)
-        window["-STATUS-"].update("Idle" if not cancel_requested else "Stopped")
+        set_cutter_job_controls(window, False, "Idle" if not cancel_requested else "Stopped")
 
     if event == "-STOP-":
         cancel_requested = True
@@ -1005,6 +1366,170 @@ while True:
                     window["-LOG-"].print(f"[STOP] Error killing process: {ex}")
         window["-STOP-"].update(disabled=True)
         window["-STATUS-"].update("Stopping...")
+
+    if event == "-LOAD_TXT-":
+        try:
+            f = sg.popup_get_file(
+                "Select cuts file",
+                file_types=(("Text Files", "*.txt"), ("All Files", "*.*")),
+                no_window=False,
+                title="Load Cuts",
+            )
+            if f:
+                with open(f, "r", encoding="utf-8-sig") as fh:
+                    content = fh.read()
+                window["-TEXT-"].update(content)
+                window["-LOG-"].print(f"[INFO] Loaded cuts file: {f}")
+        except Exception as e:
+            sg.popup_error(f"Failed to load cuts file:\n{e}", title="Error")
+
+    if event == "-SAVE_TXT-":
+        try:
+            f = sg.popup_get_file(
+                "Save cuts file",
+                save_as=True,
+                default_extension=".txt",
+                file_types=(("Text Files", "*.txt"), ("All Files", "*.*")),
+                no_window=False,
+                title="Save Cuts",
+            )
+            if f:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(values.get("-TEXT-", ""))
+                window["-LOG-"].print(f"[INFO] Saved cuts file: {f}")
+        except Exception as e:
+            sg.popup_error(f"Failed to save cuts file:\n{e}", title="Error")
+
+    # ------------------------------------------------------------------ #
+    #  Automated Cutter queue                                             #
+    # ------------------------------------------------------------------ #
+
+    if event == "-IN-" and values.get("-Q_AUTO_SCAN-"):
+        folder = values.get("-IN-", "").strip()
+        if folder and os.path.isdir(folder) and folder != last_in_folder:
+            last_in_folder = folder
+            set_cutter_job_controls(window, True, "Scanning...")
+            window["-LOG-"].print(f"[SCAN] Input folder changed: {folder}")
+            threading.Thread(target=queue_scan, args=(folder, window), daemon=True).start()
+
+    if event == "-Q_AUTO_SCAN-" and values.get("-Q_AUTO_SCAN-"):
+        folder = values.get("-IN-", "").strip()
+        if folder and os.path.isdir(folder):
+            last_in_folder = folder
+            set_cutter_job_controls(window, True, "Scanning...")
+            window["-LOG-"].print(f"[SCAN] Auto-scan enabled: {folder}")
+            threading.Thread(target=queue_scan, args=(folder, window), daemon=True).start()
+
+    if event == "-Q_SCAN-":
+        folder = values.get("-IN-", "").strip()
+        if not folder or not os.path.isdir(folder):
+            sg.popup("Select a valid Input Folder before scanning.")
+        elif not FFPROBE:
+            sg.popup_error("Cannot scan: ffprobe is missing.", title="Error")
+        else:
+            last_in_folder = folder
+            set_cutter_job_controls(window, True, "Scanning...")
+            window["-LOG-"].print(f"[SCAN] Scanning: {folder}")
+            threading.Thread(target=queue_scan, args=(folder, window), daemon=True).start()
+
+    if event == "-Q_ADD_FILES-":
+        selected = sg.popup_get_file(
+            "Select video files", multiple_files=True,
+            file_types=(("Video Files", "*.mp4 *.m4v *.mov *.mkv *.avi *.ts *.webm"),
+                        ("All Files", "*.*")), no_window=False, title="Add Files")
+        if selected:
+            paths = selected.split(";") if isinstance(selected, str) else selected
+            paths = [p.strip() for p in paths if p and os.path.isfile(p)
+                     and os.path.splitext(p)[1].lower() in VIDEO_EXTS and p not in queue_meta]
+            if paths:
+                folder = values.get("-IN-", "").strip()
+                set_cutter_job_controls(window, True, "Scanning files...")
+                window["-LOG-"].print(f"[QUEUE] Adding {len(paths)} file(s).")
+                threading.Thread(target=queue_scan,
+                                 args=(folder, window, paths, True), daemon=True).start()
+
+    if event == "-Q_REMOVE-":
+        selected = values.get("-Q_TABLE-", [])
+        for index in sorted(selected, reverse=True):
+            if 0 <= index < len(queue_meta):
+                path = list(queue_meta.keys())[index]
+                queue_meta.pop(path, None)
+                window["-LOG-"].print(f"[QUEUE] Removed: {path}")
+        refresh_queue_table()
+
+    if event == "-Q_CLEAR-":
+        queue_meta.clear()
+        refresh_queue_table()
+        window["-LOG-"].print("[QUEUE] Cleared.")
+
+    if event == "-Q_SCAN_DONE-":
+        result = values.get("-Q_SCAN_DONE-", {}) or {}
+        incoming = result.get("meta", {})
+        append = result.get("append", False)
+        if append:
+            queue_meta.update(incoming)
+        else:
+            # A normal scan refreshes input-folder rows but retains files added
+            # explicitly from elsewhere.
+            for path in [p for p, m in queue_meta.items() if m.get("input_managed")]:
+                queue_meta.pop(path, None)
+            queue_meta.update(incoming)
+        refresh_queue_table()
+        set_cutter_job_controls(window, False, "Idle")
+        window["-LOG-"].print(f"[SCAN] Found {len(incoming)} video(s).")
+        scanned_paths = list(incoming.keys())
+        if result.get("watch"):
+            _run_queue_all(window, values, scanned_paths)
+        elif values.get("-Q_AUTO_RUN-"):
+            _run_queue_all(window, values)
+
+    if event == "-Q_ROW_STATUS-":
+        data = values.get("-Q_ROW_STATUS-", {}) or {}
+        path = data.get("path")
+        if path in queue_meta:
+            queue_meta[path]["status"] = data.get("status", queue_meta[path]["status"])
+            refresh_queue_table()
+
+    if event == "-Q_RUN_DONE-":
+        set_cutter_job_controls(window, False, "Stopped" if cancel_requested else "Idle")
+        window["-LOG-"].print("[QUEUE] Stopped." if cancel_requested else "[QUEUE] All ready rows finished.")
+
+    if event == "-Q_RUN_ALL-":
+        if not FFMPEG or not FFPROBE:
+            sg.popup_error("Cannot start: ffmpeg or ffprobe is missing!", title="Error")
+        else:
+            _run_queue_all(window, values)
+
+    if event == "-Q_WATCH-":
+        watch_enabled = bool(values.get("-Q_WATCH-"))
+        watch_sizes.clear()
+        folder = values.get("-IN-", "").strip()
+        watch_known = set(collect_videos(folder)) if watch_enabled else set()
+        last_watch_time = time.time()
+        window["-LOG-"].print("[WATCH] Enabled." if watch_enabled else "[WATCH] Disabled.")
+
+    # New files are deliberately observed twice before scanning, avoiding files
+    # that are still being copied into the input folder.
+    if (watch_enabled and not (worker_thread and worker_thread.is_alive())
+            and not (queue_worker_thread and queue_worker_thread.is_alive())
+            and not (fixer_worker_thread and fixer_worker_thread.is_alive())):
+        folder = values.get("-IN-", "").strip()
+        try:
+            interval = max(1, int(values.get("-Q_INTERVAL-", "10")))
+        except (TypeError, ValueError):
+            interval = 10
+        if folder and os.path.isdir(folder) and time.time() - last_watch_time >= interval:
+            last_watch_time = time.time()
+            current = {p: os.path.getsize(p) for p in collect_videos(folder)}
+            stable_new = [p for p, size in current.items()
+                          if p not in watch_known and watch_sizes.get(p) == size]
+            watch_sizes = current
+            if stable_new:
+                watch_known.update(stable_new)
+                set_cutter_job_controls(window, True, "Watching scan...")
+                window["-LOG-"].print(f"[WATCH] Stable new file(s): {len(stable_new)}")
+                threading.Thread(target=queue_scan,
+                                 args=(folder, window, stable_new, True, True), daemon=True).start()
 
     if event == "-RUN-":
         if not FFMPEG or not FFPROBE:
@@ -1029,11 +1554,7 @@ while True:
             sg.popup("No videos parsed from textbox. Check format.")
             continue
 
-        window["-RUN-"].update(disabled=True)
-        window["-STOP-"].update(disabled=False)
-        window["-STATUS-"].update("Running")
-        window["-FIX_CHECK-"].update(disabled=True)
-        window["-FIX_RUN-"].update(disabled=True)
+        set_cutter_job_controls(window, True, "Running")
 
         worker_thread = threading.Thread(
             target=processing_worker,
@@ -1103,8 +1624,14 @@ while True:
             cancel_requested = False
             window["-FIX_CHECK-"].update(disabled=True)
             window["-FIX_RUN-"].update(disabled=True)
+            for key in ("-FIX_ADD_FILES-", "-FIX_ADD_FOLDER-", "-FIX_REMOVE-", "-FIX_CLEAR-"):
+                window[key].update(disabled=True)
             window["-FIX_STOP-"].update(disabled=False)
             window["-RUN-"].update(disabled=True)
+            for key in ("-Q_RUN_ALL-", "-Q_SCAN-", "-Q_ADD_FILES-", "-Q_REMOVE-", "-Q_CLEAR-"):
+                window[key].update(disabled=True)
+            window["-LOAD_TXT-"].update(disabled=True)
+            window["-SAVE_TXT-"].update(disabled=True)
             window["-STATUS-"].update("Checking...")
             fixer_worker_thread = threading.Thread(
                 target=fixer_check_worker,
@@ -1149,8 +1676,14 @@ while True:
             cancel_requested = False
             window["-FIX_CHECK-"].update(disabled=True)
             window["-FIX_RUN-"].update(disabled=True)
+            for key in ("-FIX_ADD_FILES-", "-FIX_ADD_FOLDER-", "-FIX_REMOVE-", "-FIX_CLEAR-"):
+                window[key].update(disabled=True)
             window["-FIX_STOP-"].update(disabled=False)
             window["-RUN-"].update(disabled=True)
+            for key in ("-Q_RUN_ALL-", "-Q_SCAN-", "-Q_ADD_FILES-", "-Q_REMOVE-", "-Q_CLEAR-"):
+                window[key].update(disabled=True)
+            window["-LOAD_TXT-"].update(disabled=True)
+            window["-SAVE_TXT-"].update(disabled=True)
             window["-STATUS-"].update("Fixing...")
             window["-FIX_PROG-"].update(0)
             window["-FIX_COUNTER-"].update(f"0/{len(jobs)}")
@@ -1204,8 +1737,14 @@ while True:
     if event == "-FIX_DONE-":
         window["-FIX_CHECK-"].update(disabled=False)
         window["-FIX_RUN-"].update(disabled=False)
+        for key in ("-FIX_ADD_FILES-", "-FIX_ADD_FOLDER-", "-FIX_REMOVE-", "-FIX_CLEAR-"):
+            window[key].update(disabled=False)
         window["-FIX_STOP-"].update(disabled=True)
         window["-RUN-"].update(disabled=False)
+        for key in ("-Q_RUN_ALL-", "-Q_SCAN-", "-Q_ADD_FILES-", "-Q_REMOVE-", "-Q_CLEAR-"):
+            window[key].update(disabled=False)
+        window["-LOAD_TXT-"].update(disabled=False)
+        window["-SAVE_TXT-"].update(disabled=False)
         window["-STATUS-"].update("Idle" if not cancel_requested else "Stopped")
         window["-FIX_PROG-"].update(0)
 

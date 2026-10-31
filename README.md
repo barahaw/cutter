@@ -1,4 +1,4 @@
-# AI-Powered Video Fixer for Windows
+# SceneTrim & AI-Powered Video Fixer for Windows
 
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)](https://microsoft.com/windows)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
